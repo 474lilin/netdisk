@@ -1,0 +1,167 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  background: #f5f5f5;
+}
+
+/* 文件列表行 */
+.file-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.file-name-cell .name-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 上传队列 */
+.upload-queue .ant-list-item {
+  padding: 8px 0;
+}
+
+/* 拖拽上传覆盖层 */
+.drag-upload-zone {
+  position: relative;
+}
+
+/* 预览容器 */
+.preview-container {
+  background: #1f1f1f;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 480px;
+  max-height: 70vh;
+  overflow: auto;
+  border-radius: 4px;
+}
+
+.preview-container img,
+.preview-container video,
+.preview-container audio,
+.preview-container canvas {
+  max-width: 100%;
+  max-height: 70vh;
+}
+
+.preview-container iframe {
+  width: 100%;
+  height: 70vh;
+  border: none;
+  background: #fff;
+}
+
+.pdf-preview {
+  width: 100%;
+  height: 70vh;
+  overflow: auto;
+  background: #525659;
+  padding: 16px;
+}
+
+.pdf-preview canvas {
+  margin: 0 auto 16px;
+  display: block;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+  background: #fff;
+}
+
+.doc-preview {
+  background: #fff;
+  padding: 32px;
+  min-height: 480px;
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.xls-preview {
+  background: #fff;
+  padding: 16px;
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.text-preview {
+  background: #fff;
+  padding: 16px;
+  min-height: 480px;
+  max-height: 70vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 13px;
+}
+
+/* 登录页 */
+.login-page {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #0b1e3a 0%, #12305e 100%);
+}
+
+.login-card {
+  width: 380px;
+  padding: 40px 36px 28px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+
+.login-title {
+  text-align: center;
+  font-size: 22px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #1f1f1f;
+}
+
+.login-subtitle {
+  text-align: center;
+  color: #8c8c8c;
+  margin-bottom: 28px;
+  font-size: 13px;
+}
+
+/* 侧边栏 */
+.sider-menu .ant-menu-item {
+  height: 40px;
+  line-height: 40px;
+}
+
+/* ---------- 移动端响应式（<768px） ---------- */
+@media (max-width: 768px) {
+  /* 登录卡片全宽自适应 */
+  .login-card {
+    width: calc(100vw - 32px);
+    padding: 28px 20px 20px;
+  }
+  /* 目录分享页：卡片与容器留边 */
+  .share-dir-page {
+    padding: 12px;
+  }
+  /* 文件浏览容器（antd Card 白底）padding 收紧 */
+  .ant-layout-content > div {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+  /* 上传队列列表行更紧凑 */
+  .upload-queue .ant-list-item {
+    padding: 6px 0;
+  }
+}

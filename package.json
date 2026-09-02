@@ -1,0 +1,19 @@
+{
+  "name": "minio-netdisk",
+  "version": "1.0.0",
+  "description": "> **数据 100% 留在企业自己的服务器上** —— 一套 Docker 命令部署，离线可交付。 > 三级空间 / 细粒度权限 / 断点续传 / 去重秒传 / 版本管理 / 全量审计 / 2FA。",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright-core": "^1.62.1"
+  }
+}

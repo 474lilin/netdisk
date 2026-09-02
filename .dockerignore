@@ -1,0 +1,18 @@
+# 根 .dockerignore（web 构建上下文为仓库根；server 使用自己的 .dockerignore）
+node_modules
+**/node_modules
+dist
+**/dist
+.env
+.env.*
+!.env.example
+.git
+*.log
+docs
+server
+deploy/postgres
+deploy/minio-init
+docker-compose*.yml
+README.md
+e2e
+backups

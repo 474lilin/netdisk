@@ -1,0 +1,211 @@
+# =============================================================================
+# 企业私有化网盘 - docker-compose 主编排（单机版：MinIO 单盘命名卷，最优性能）
+# 存储说明：单节点单数据目录（无纠删码）——单机多"盘"若为同一物理盘/同一挂载，
+#   纠删码只有 I/O 放大、无冗余收益（实测 4 盘纠删码 vs 单盘：拷贝 21 vs 104 MB/s）。
+#   多盘纠删码（2+2）仅在 4 块真实独立物理盘上才有意义，示例见
+#   docker-compose.distributed.yml 与 docs/02-部署手册.md。
+# 数据盘：命名卷（VM 内 ext4，快于 bind mount）；如需大容量数据盘，
+#   参考 docker-compose.override.yml 的 bind mount 模式。
+# 用法: cp .env.example .env && docker compose up -d --build
+# =============================================================================
+name: minio-netdisk
+
+x-common-env: &common-env
+  TZ: ${TZ:-Asia/Shanghai}
+
+services:
+  # ---------- PostgreSQL：元数据库（不存文件二进制） ----------
+  postgres:
+    image: postgres:16-alpine
+    container_name: netdisk-postgres
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      POSTGRES_DB: ${POSTGRES_DB:-netdisk}
+      POSTGRES_USER: ${POSTGRES_USER:-netdisk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+      PGDATA: ${PGDATA:-/var/lib/postgresql/data}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      # 初始化脚本（建表/索引/扩展），仅首次初始化时执行
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-netdisk} -d ${POSTGRES_DB:-netdisk}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [netdisk-net]
+
+  # ---------- MinIO 对象存储（社区版，单节点单盘命名卷，最优性能） ----------
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: netdisk-minio
+    restart: unless-stopped
+    # 单数据目录：无纠删码（单机多"盘"同物理盘时纠删码无冗余收益且拖慢 I/O）
+    # 多盘纠删码（2+2）示例见 docker-compose.distributed.yml（需 4 块独立物理盘）
+    command: server --console-address ":9001" /data1
+    environment:
+      <<: *common-env
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?请在 .env 中设置 MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?请在 .env 中设置 MINIO_ROOT_PASSWORD}
+    ports:
+      # S3 API（浏览器经后端签名 URL 访问）
+      - "${MINIO_EXTERNAL_PORT:-9000}:9000"
+      # Web 管理台（仅运维使用，生产建议不对外暴露）
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [netdisk-net]
+
+  # ---------- Redis：热点缓存（目录列表/分享元信息）；缓存可丢弃，不持久化 ----------
+  redis:
+    image: redis:7-alpine
+    container_name: netdisk-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [netdisk-net]
+
+  # ---------- MinIO 初始化：建桶 / 开版本控制 / 配 CORS ----------
+  minio-init:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    container_name: netdisk-minio-init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?请在 .env 中设置 MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?请在 .env 中设置 MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-netdisk-data}
+    volumes:
+      - ./deploy/minio-init:/init:ro
+    entrypoint: ["/bin/sh", "/init/init.sh"]
+    networks: [netdisk-net]
+
+  # ---------- 业务后端（Node.js，唯一持有 MinIO 密钥的服务） ----------
+  server:
+    build:
+      context: ./server
+    image: minio-netdisk/server:${VERSION:-1.0.0}
+    container_name: netdisk-server
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      NODE_ENV: production
+      PORT: 3000
+      # 进程数：默认 min(4, CPU 核数)；1 = 单进程（cluster 关闭）
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-}
+      DATABASE_URL: postgres://${POSTGRES_USER:-netdisk}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-netdisk}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?请在 .env 中设置 JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?请在 .env 中设置 JWT_REFRESH_SECRET}
+      COOKIE_SECRET: ${COOKIE_SECRET:?请在 .env 中设置 COOKIE_SECRET}
+      # 容器内访问 MinIO 的地址
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: "9000"
+      MINIO_USE_SSL: "false"
+      # 浏览器访问 MinIO 的地址（签名 URL Host，可填服务器内网 IP）
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-minio}
+      MINIO_PUBLIC_PORT: ${MINIO_PUBLIC_PORT:-9000}
+      MINIO_PUBLIC_USE_SSL: ${MINIO_PUBLIC_USE_SSL:-false}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-netdisk-data}
+      PRESIGN_EXPIRY: ${PRESIGN_EXPIRY:-3600}
+      PART_SIZE: ${PART_SIZE:-16777216}
+      SMALL_FILE_THRESHOLD: ${SMALL_FILE_THRESHOLD:-8388608}
+      VERIFY_SHA256_THRESHOLD: ${VERIFY_SHA256_THRESHOLD:-67108864}
+      DEDUP_INLINE_MAX: ${DEDUP_INLINE_MAX:-1073741824}
+      # 去重池 GC 保留期（天）：零引用池超过该天数后由每日任务清理（池作为秒传缓存保留）
+      POOL_GC_DAYS: ${POOL_GC_DAYS:-30}
+      # B3SEG 段缓存内存预算（MB）：段数据缓存容量（LRU），0 表示仅段哈希缓存（极小内存）
+      HASH_CACHE_MB: ${HASH_CACHE_MB:-512}
+      # Redis 热点缓存（目录列表/分享元信息）；REDIS_ENABLED=false 时降级为无缓存
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # 监控告警：Redis 内存使用率阈值（%）、命中率最小采样量、自检频率
+      MONITOR_REDIS_MEM_PCT: ${MONITOR_REDIS_MEM_PCT:-80}
+      MONITOR_HITRATE_MIN_SAMPLE: ${MONITOR_HITRATE_MIN_SAMPLE:-200}
+      MONITOR_CHECK_CRON: ${MONITOR_CHECK_CRON:-*/5 * * * *}
+      # 告警通知渠道（未配置即跳过；可多选）：钉钉机器人 / 企业微信机器人 / 通用 webhook / SMTP 邮件
+      ALERT_DINGTALK_WEBHOOK: ${ALERT_DINGTALK_WEBHOOK:-}
+      ALERT_DINGTALK_SECRET: ${ALERT_DINGTALK_SECRET:-}
+      ALERT_WECOM_WEBHOOK: ${ALERT_WECOM_WEBHOOK:-}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_SMTP_HOST: ${ALERT_SMTP_HOST:-}
+      ALERT_SMTP_PORT: ${ALERT_SMTP_PORT:-465}
+      ALERT_SMTP_SECURE: ${ALERT_SMTP_SECURE:-true}
+      ALERT_SMTP_USER: ${ALERT_SMTP_USER:-}
+      ALERT_SMTP_PASS: ${ALERT_SMTP_PASS:-}
+      ALERT_MAIL_FROM: ${ALERT_MAIL_FROM:-}
+      ALERT_MAIL_TO: ${ALERT_MAIL_TO:-}
+      # 密码找回通道：邮箱（SMTP）验证码；短信（自建网关 webhook，POST {phone, code}）
+      RESET_MAIL_HOST: ${RESET_MAIL_HOST:-}
+      RESET_MAIL_PORT: ${RESET_MAIL_PORT:-465}
+      RESET_MAIL_SECURE: ${RESET_MAIL_SECURE:-true}
+      RESET_MAIL_USER: ${RESET_MAIL_USER:-}
+      RESET_MAIL_PASS: ${RESET_MAIL_PASS:-}
+      RESET_MAIL_FROM: ${RESET_MAIL_FROM:-}
+      RESET_SMS_WEBHOOK: ${RESET_SMS_WEBHOOK:-}
+      TRASH_RETENTION_DAYS: ${TRASH_RETENTION_DAYS:-30}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      QUOTA_RECOMPUTE_CRON: ${QUOTA_RECOMPUTE_CRON:-0 3 * * *}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请在 .env 中设置 ADMIN_PASSWORD}
+      ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-系统管理员}
+      LDAP_ENABLED: ${LDAP_ENABLED:-false}
+      LDAP_URL: ${LDAP_URL:-}
+      LDAP_BIND_DN: ${LDAP_BIND_DN:-}
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD:-}
+      LDAP_BASE_DN: ${LDAP_BASE_DN:-}
+      LDAP_USER_FILTER: ${LDAP_USER_FILTER:-}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks: [netdisk-net]
+
+  # ---------- Web 前端（Nginx 托管静态资源 + 反向代理 /api） ----------
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: minio-netdisk/web:${VERSION:-1.0.0}
+    container_name: netdisk-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    networks: [netdisk-net]
+
+volumes:
+  pg-data:
+  minio-data:
+
+networks:
+  netdisk-net:
+    driver: bridge

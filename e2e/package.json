@@ -1,0 +1,13 @@
+{
+  "name": "minio-netdisk-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "浏览器端到端验证（playwright-core + 本机 Edge，无需下载浏览器）",
+  "type": "module",
+  "scripts": {
+    "e2e": "node browser-e2e.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.49.1"
+  }
+}
