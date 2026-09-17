@@ -21,6 +21,18 @@
   docker exec netdisk-minio sh -c "df -h /data1"                   # 容器内视角
   docker logs netdisk-server --since 24h 2>&1 | Select-String XMinioStorageFull
   ```
+- **最终处置（2026-09-17，按用户决定：本地有原件，不走救援、网盘清干净）**：
+  - 已删除回收站里全部死条目：`delete from files where is_deleted = true`（2739 行，
+    级联清掉 `file_versions` 2776 行、`share_grants`/`share_links`）；
+    并清空陈旧去重池 `delete from dedup_pool`（1446 行）。
+  - 现库内：`files=0 / file_versions=0 / dedup_pool=0`；**保留 590 个空目录**（原目录结构，
+    便于按原位置重传；若要彻底清空目录树另说）。
+  - MinIO 桶只剩 `netdisk-data`，**对象数 0**（残留的自测对象已逐 key 清除）；
+    `/data1/netdisk-data` 仍有约 700MB MinIO 元数据（tombstone/xl.meta），对功能无影响。
+  - 用户将**从本地原件重传**；`E:\netdisk-backups\lost-manifest.csv` 可作对照清单。
+  - 救援脚本 `e2e/_rescue-rebuild.mjs` 保留备用（本次未使用）；库内 `lost_20260917_*` 备份表保留。
+  - 复传前请知悉：**同名同内容重传曾会被误判秒传**，该缺陷已在 v1.1.14 修复并实测通过。
+
 - **回收空间（安全顺序）**：
   ```powershell
   $u=(Select-String -Path .env -Pattern '^MINIO_ROOT_USER=').Line -replace '^MINIO_ROOT_USER=',''
