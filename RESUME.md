@@ -35,6 +35,53 @@
   > 另：`N:\minio-data-backup-20260826`（14.5GB 陈旧原始副本）已于 2026-09-17 移到 `E:\`，
   > 未删除；`.env`/override 未改动。
 
+## 0. ⚠️ 事故记录与救援（2026-09-17）：整桶误删，正在反删除救援
+
+### 发生了什么
+执行「清理孤儿对象」时用了：
+`mc rm --recursive --force --versions --stdin nd/netdisk-data < 清单文件>`
+**在启用版本控制的桶上，该命令会忽略 stdin 清单，直接递归删除路径参数（整个桶）下的一切**。
+实测复现：临时桶里只列 2 个 key，执行后 5 个对象全被删；换成非版本化桶则只删清单内的 2 个。
+（此前只用"单个 key"试删过：那时路径参数恰好就是那个 key，所以看起来正确 —— 错误的推广。）
+后果：`netdisk-data` 全部对象被物理删除（2587 个在线文件 67GB + 回收站 11GB + 去重池对象）。
+
+### 现状
+- **数据库完好**：文件/目录树、文件名、大小、**B3SEG 哈希**、`object_key`、owner、时间全在。
+- MinIO：`/data1/netdisk-data` 仅剩约 700MB 元数据，对象不存在。
+- N: 空闲 153GB；`vssadmin` 查 N: **无卷影副本**；`backups/` 只有 pg_dump（无对象）。
+- `E:\minio-data-backup-20260826`（8/26 那份）是**8/27 已确认删除的老数据**，抽样 0/20 命中当前文件，救不了这次。
+- 关键前提：下载接口 `presignGet(object_key)` **不锁 version_id**（按 key 取当前版本）
+  → **只要把对象内容放回原 key，网盘无需改库即可恢复**（`version_id` 只影响历史版本回滚）。
+
+### 救援步骤（已备好脚本，脚本已自测通过）
+```powershell
+# 1) 立刻止损：不要再往 N: 写任何东西（别上传、别拷文件进去），Docker 可保持运行
+# 2) 用反删除工具把整棵目录按"保留路径"恢复到暂存目录（**绝不能恢复到 N:**）
+#    目标路径：N:\minio-data-single\netdisk-data     推荐工具：DiskGenius / R-Studio / Recuva
+#    纯签名恢复（PhotoRec 无路径）也行——脚本会按内容哈希自动匹配
+#    暂存目录建议：E:\recover-stage （E: 需容纳 ~73GB）
+# 3) 分析（只读，不动数据）
+$env:STAGE='E:\recover-stage'; node e2e/_rescue-rebuild.mjs analyze
+# 4) 回传（校验通过的对象才上传到原 key：mc cp 到 nd/netdisk-data/<原 key>）
+$env:STAGE='E:\recover-stage'; node e2e/_rescue-rebuild.mjs restore
+# 5) 复核
+node e2e/_verify-storage-integrity.mjs
+```
+- 脚本判定依据（逐一验证，不猜）：文件对象用 `files.size_bytes` + `files.sha256`（B3SEG）；
+  去重池对象用 `dedup_pool.size_bytes` + key 末尾的 sha256 段。
+  支持单盘布局的 `part.1…part.N` 分片拼接与小对象"内联在 xl.meta 尾部"两种形态。
+- 产物：`E:\netdisk-backups\recovery-plan.json`（回传计划）、`recovery-missing.csv`（救不回来的对象）、
+  `lost-manifest.csv`（2587 个丢失文件的完整路径/大小，供对照本地原件重传）。
+- 自测记录：`node e2e/tmp/_rescue-selftest.mjs` → 分片对象与内联对象均恢复、错误内容被拒、
+  拼接结果与原始字节完全一致；`restore` 通道实测 2/2 上传成功。
+
+### 永久禁令（写死在这里，避免重犯）
+1. **禁止** `mc rm --recursive --force --versions --stdin <alias>/<bucket>` 这种"清单+递归"组合；
+   版本化桶下删除**必须逐 key 指定完整路径**：`mc rm --recursive --force --versions nd/netdisk-data/<key>`。
+2. 任何批量删除前必须先跑**数据库反查**（files / file_versions / upload_sessions / dedup_pool / sha256 派生
+   六条通道全部 0 引用），并用 `--dry-run` 或临时桶验证**命令形式本身**，而不是只验证清单内容。
+3. 大清理前先做 `pg_dump` + **对象镜像**（`mc mirror`），不要只备份元数据。
+
 ## 1. 当前状态快照（2026-09-17 核对）
 
 - 5 容器：`netdisk-server` / `netdisk-web` / `netdisk-minio` / `netdisk-postgres` / `netdisk-redis`（全部 healthy）

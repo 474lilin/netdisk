@@ -1142,8 +1142,20 @@ export async function initUpload(
   const isOverwrite = Boolean(existing);
 
   // 同名且内容一致（哈希相同）：无需上传、不产生新版本，直接秒传成功
+  //
+  // v1.1.14 加固：**秒传前必须确认对象真的还在**。历史实现只看数据库哈希就返回 dedup=true，
+  // 一旦 MinIO 对象因误删/清理/迁移而缺失，就会把"内容其实已经没了"的文件判为秒传成功——
+  // 用户界面上看到上传完成，下载却 404（2026-09-17 整桶误删后的重传场景会 100% 踩中）。
+  // 现在：对象不存在 → 不秒传，继续走真实上传（覆盖语义下用的还是同一个 object_key）。
   if (isOverwrite && sha256 && existing!.sha256 === sha256) {
-    return { dedup: true, file: fileToDto(existing!) };
+    if (await objectExists(existing!.object_key)) {
+      return { dedup: true, file: fileToDto(existing!) };
+    }
+    logger.warn('同名同哈希但 MinIO 对象缺失，放弃秒传改走真实上传', {
+      fileId: existing!.id,
+      objectKey: existing!.object_key,
+      dedupRef: existing!.dedup_ref,
+    });
   }
 
   // 配额校验（覆盖时按增量计算；新增按全量）
