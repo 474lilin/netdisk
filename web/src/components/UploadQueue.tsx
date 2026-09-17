@@ -124,6 +124,7 @@ export default function UploadQueue() {
   const pauseAll = useUploadStore((s) => s.pauseAll);
   const resumeAll = useUploadStore((s) => s.resumeAll);
   const clearCompleted = useUploadStore((s) => s.clearCompleted);
+  const clearFailed = useUploadStore((s) => s.clearFailed);
   const resumeAuth = useUploadStore((s) => s.resumeAuth);
   const cancelDownload = useUploadStore((s) => s.cancelDownload);
 
@@ -141,6 +142,12 @@ export default function UploadQueue() {
     const n = pausedCount;
     resumeAll();
     if (n > 0) message.success(`已继续 ${n} 个上传任务（从断点续传，不重复上传）`);
+  };
+
+  // 清除失败任务（v1.1.15）：失败/已取消/登录过期三类记录一次性移除，并明确提示不影响已上传文件
+  const handleClearFailed = (): void => {
+    const n = clearFailed();
+    if (n > 0) message.success(`已清除 ${n} 条失败任务记录（网盘里已上传的文件不受影响）`);
   };
 
   // ---------- 重试（v1.1.13：刷新后缺文件的任务改走「重新选择文件」） ----------
@@ -254,6 +261,7 @@ export default function UploadQueue() {
   const totalDone = tasks.filter(isDone).length;
   const totalFailed = tasks.filter((t) => t.status === 'error').length;
   const totalAuthFailed = tasks.filter((t) => t.status === 'auth-failed').length;
+  const totalCanceled = tasks.filter((t) => t.status === 'canceled').length;
   // 下载相关计数（v1.1.10）
   const downloadActive = tasks.filter((t) => isDownload(t) && ACTIVE_STATUS.has(t.status)).length;
   const uploadActive = tasks.filter((t) => !isDownload(t) && ACTIVE_STATUS.has(t.status)).length;
@@ -538,6 +546,17 @@ export default function UploadQueue() {
               重试失败
             </Button>
           </Tooltip>
+          <Tooltip title="清除失败任务记录（失败/已取消/登录过期；不影响网盘里已上传的文件）">
+            <Button
+              size="small"
+              danger
+              icon={<DeleteOutlined />}
+              disabled={totalFailed === 0 && totalCanceled === 0}
+              onClick={handleClearFailed}
+            >
+              清除失败
+            </Button>
+          </Tooltip>
           <Tooltip title="清除已完成/秒传的任务记录（列表随之收起）">
             <Button size="small" icon={<DeleteOutlined />} disabled={totalDone === 0} onClick={() => clearCompleted()}>
               清除已完成
@@ -773,6 +792,11 @@ export default function UploadQueue() {
           {totalFailed > 0 && (
             <Button block size="small" icon={<ReloadOutlined />} onClick={() => void handleRetryAll()}>
               重试失败（{totalFailed}）
+            </Button>
+          )}
+          {totalFailed + totalCanceled + totalAuthFailed > 0 && (
+            <Button block size="small" danger icon={<DeleteOutlined />} onClick={handleClearFailed}>
+              清除失败（{totalFailed + totalCanceled + totalAuthFailed}）
             </Button>
           )}
           {totalDone > 0 && (

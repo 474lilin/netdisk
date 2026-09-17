@@ -1,4 +1,4 @@
-﻿// 上传/下载任务队列（v1.1.10 起统一管理上传与下载）
+// 上传/下载任务队列（v1.1.10 起统一管理上传与下载）
 // 万级任务性能：tasks 用 Map 存储，状态更新 O(1)（数组 map 在 2 万任务时每次更新拖垮主线程）；
 // 派生数组仅在上传面板/完成判定处 useMemo 计算
 // v1.0.13：Token 过期治理——auth-failed 状态 + 队列暂停/恢复（401 时暂停，登录后继续）
@@ -124,6 +124,8 @@ interface UploadState {
   /** 一键全部继续（v1.1.5） */
   resumeAll: () => void;
   clearCompleted: () => void;
+  /** 清除失败任务（v1.1.15）：移除 error/auth-failed/canceled 三类任务，返回移除条数 */
+  clearFailed: () => number;
   setVisible: (v: boolean) => void;
   /** 最小化/展开面板（v1.1.6，持久化到 localStorage） */
   setPanelCollapsed: (v: boolean) => void;
@@ -762,6 +764,25 @@ export const useUploadStore = create<UploadState>((set, get) => ({
       }
       return { tasks: next };
     });
+  },
+
+  // 清除失败任务（v1.1.15）：把 error / auth-failed / canceled 三类"已结束且未成功"的任务从列表移除
+  //（含刷新后还原的 needsFile 失败任务）；持久化随 subscribe 自动同步，刷新后不会再回来
+  clearFailed: () => {
+    let removed = 0;
+    set((s) => {
+      const next: Record<string, UploadTask> = {};
+      for (const [id, t] of Object.entries(s.tasks)) {
+        const failed = t.status === 'error' || t.status === 'auth-failed' || t.status === 'canceled';
+        if (failed) {
+          removed += 1;
+          continue;
+        }
+        next[id] = t;
+      }
+      return removed > 0 ? { tasks: next } : {};
+    });
+    return removed;
   },
 
   setVisible: (v) => set({ visible: v }),
