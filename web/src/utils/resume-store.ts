@@ -21,6 +21,8 @@ export interface ResumeRecord {
   file?: File;
   /** 单请求直传模式（mode=1）：已 PUT 完成待 complete */
   mode1Pending?: boolean;
+  /** 客户端内容哈希：恢复/补 complete 前校验内容未变（防止同名同大小的旧内容被误提交） */
+  sha256?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -187,6 +189,20 @@ export async function loadResumeRecord(key: string): Promise<ResumeRecord | null
   return ls ? { ...ls } : null;
 }
 
+/**
+ * 立即刷入待写记录（关键节点调用：暂停/中断）
+ * saveResumeRecord 默认 500ms 合并写入；「暂停后立刻继续」若不等刷盘，
+ * 会因读不到断点记录而重开会话、重复上传已传分片。此处提供强制刷盘。
+ */
+export async function flushResumeWrites(): Promise<void> {
+  if (!flushTimer) return; // 没有待写批次
+  clearTimeout(flushTimer);
+  flushTimer = null;
+  const batch = pendingWrites;
+  pendingWrites = new Map();
+  await flushBatch(batch);
+}
+
 /** 删除记录（任务完成/中止） */
 export async function removeResumeRecord(key: string): Promise<void> {
   // 立即从合并缓冲剔除 + 标记删除（防止在途 flush 写回）
@@ -205,11 +221,18 @@ export async function removeResumeRecord(key: string): Promise<void> {
 /**
  * 服务端已传分片查询（第三轮 3.2）：即使本地无记录，也能从服务端恢复进度
  * 返回已传分片号数组；与本地 partsEtag 合并（本地优先，缺失的分片从服务端补）
+ * 注意：服务端占位（'server'）**没有 ETag**，无法参与 complete，上传引擎会把这些分片
+ * 视为「需真实重传」（v1.1.8：旧实现把它们当已完成，导致 complete 空清单 / 永久卡住）
  */
-export async function mergeServerParts(sessionId: string, localEtag: Record<number, string>): Promise<Record<number, string>> {
+export async function mergeServerParts(
+  sessionId: string,
+  localEtag: Record<number, string>,
+  signal?: AbortSignal
+): Promise<Record<number, string>> {
   try {
     const res = await fetch(`/api/files/upload/parts?sessionId=${sessionId}`, {
       headers: { Authorization: 'Bearer ' + (localStorage.getItem('nd_access_token') ?? '') },
+      signal,
     });
     if (!res.ok) return localEtag;
     const data = (await res.json()) as { uploaded?: number[] };

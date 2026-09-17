@@ -1,21 +1,26 @@
 # 开机续接指南（RESUME）
 
-> 更新：2026-08-25 关机前（v1.1.1 审查加固完成；环境已清理）。下次开机继续开发/测试前先读本文。
+> 更新：2026-09-16（v1.1.12 网盘功能全面体检：33 项全通过，并修复「任务面板盖住行内下拉菜单」）。
+> 下次继续开发/测试前先读本文。
 
-## 1. 当前状态快照
+## 1. 当前状态快照（2026-09-16 核对）
 
 - 5 容器：`netdisk-server` / `netdisk-web` / `netdisk-minio` / `netdisk-postgres` / `netdisk-redis`（全部 healthy）
 - **MinIO 拓扑：单盘**（默认命名卷 `minio-data`；本地 override 单盘 bind 到 `N:\minio-data-single`；
   旧 4 盘纠删码数据在 `N:\minio-data\data1..4` 已不再读取，确认无需后可删除释放空间）
 - **Redis 热点缓存**：目录列表（`dir:{orgId}:{userId}:{dirId}`，TTL 30s）+ 分享元信息（`share:{token}`，TTL 15s/到期精确）；写操作主动失效；权限实时校验不缓存
-- PostgreSQL：`files=21416`（活跃；含**用户真实数据** Python 项目目录树 + `history_lottery_实测_*`
-  测试目录约 21363 文件，测试目录可清理）、回收站 0、`dedup_pool`（去重缓存池）、`users=1`、
-  无进行中上传会话
-- 部署版本：web/server 均为最新（v1.1.1 审查加固已含：IndexedDB fallback / 批量写合并 /
-  增量上报 / 分批恢复）
+- **PostgreSQL 实际数据**：`files=807`（活跃）、`directories=1449`、回收站 152 项、
+  `dedup_pool=485`、`users=2`（admin 管理员 + demo 演示账号）
+  - 注：2026-08-27 曾按用户确认清空全部数据（含 21k 测试目录），此后为新一轮真实上传数据
+- **部署版本**：web/server 均为 **v1.1.12**（镜像构建 2026-09-14，代码与镜像一致已核对）
+  - v1.1.11：修复「上传目标目录已删除」404 风暴（立即失败 + 整批清理 + 按目录暂停）
+  - v1.1.12：全功能体检 33 项通过；修复任务面板 z-index 遮挡行内下拉菜单
 - Docker VM：6GB / 4 核（`.wslconfig`）；镜像加速 `docker.m.daocloud.io`
-- 代码目录：`N:\奇思妙想\minio-netdisk`（**非 git 仓库**，改代码前建议自行备份）
-- 备份方式：`docs/04-备份与恢复.md`（pg_dump + mc mirror）
+- **代码仓库：已初始化 git 并推送 GitHub** —— https://github.com/474lilin/netdisk（Public）
+  - 本地目录 `N:\奇思妙想\minio-netdisk`；远端 `origin`
+  - `.gitignore` 已排除 `.env`/备份/测试残留/本机 override（.env 仅存本地，不入库）
+  - 推送命令：`git add -A && git commit -m "..." && git push`
+- 备份方式：`docs/04-备份与恢复.md`（pg_dump + mc mirror）；关机前备份在 `backups/`（本地，不入库）
 
 ## 2. 开机重启步骤
 
@@ -298,6 +303,38 @@ cd e2e && node _qa-t4.mjs; cd ..; node deploy/scripts/_qa-t5.mjs
      恢复工具：`e2e/_recover-*.mjs`；MinIO 数据卷备份：`N:\minio-data-backup-20260826`
    - 测试脚本：`e2e/_big-folder-upload.mjs`（21k 全量）、`_perf500.mjs`、`_inpage-fetch.mjs`、
      `_server-throughput.mjs`、`_folder-conc.mjs`、`_single-timing.mjs`
+   - **v1.1.4 产品化**：售前/交付/演示文档（docs/08-10）+ README 产品首页 + 一键演示脚本
+   - **v1.1.5 上传体验修复（用户反馈）**：偶发「请求失败，请稍后重试」→ 瞬时故障自愈；
+     暂停/继续（单任务 + 全选批量 + 全部暂停/一键全部继续）；上传面板改为不遮挡页面的悬浮卡片。
+     详见 `CHANGELOG.md` v1.1.5 与 `docs/upload-architecture.md` 第 5 节。
+     验证：`node --import ./e2e/ts-register.mjs e2e/_upload-resilience.ts` → 25/25 通过
+     （受限环境无法跑 esbuild/tsx 与 Docker，故用 Node 原生 TS 剥离 + 伪造 XHR/fetch 做逻辑验证）
+     顺带修复 3 个隐性缺陷：迟到进度覆盖已结算状态（运行令牌）、迟到回调复活死会话（recordWrites）、
+     暂停后立刻继续读不到断点（flushResumeWrites）
+   - **v1.1.6/v1.1.7 上传任务列表常驻**：不再自动隐藏 + 顶栏固定入口；桌面端改为**右侧占位常驻栏**
+     （不覆盖文件列表，可收起为 48px 细栏），移动端保持底部面板
+   - **v1.1.8 上传可靠性根因修复（真实浏览器复现 + 服务端日志定位）**：
+     ① **并发哈希串号（P0）**：客户端 BLAKE3 worker 池用「分片序号」当请求 ID，多文件并发哈希时
+        互相 resolve → 上报错误哈希 → 服务端 400「文件哈希校验失败」→ 界面「请求失败，点重试又能成功」
+        （≤8MB 走主线程原子哈希，故只在大文件出现）。修复：请求 ID 全局唯一。
+     ② **暂停后「全部继续」卡死**：暂停未中断 JSON 接口 → 服务端已完成落库、客户端丢弃结果 →
+        再次 complete 撞 MinIO NoSuchUpload(500) → 永久「上传中」。修复三层：
+        接口 AbortSignal + 服务端 complete 幂等自愈 + 客户端 init 校验自愈 + store 先判成功。
+     ③ 常驻栏宽度自适应（900px 窗口文件列表 256px → 356px）
+     测试套件（真实浏览器 Playwright + 本机 Edge，需 danger-full-access 才能 spawn 浏览器）：
+     `_ui-hash-check.mjs`（并发哈希 vs 串行基准）、`_ui-upload-flow.mjs`（4 场景，抓全部 4xx/5xx）、
+     `_ui-dock-check.mjs`（布局几何+命中测试+4 种窗口宽度）、`_cleanup-tests.mjs`（软删→purge 清理测试数据）
+     运行前先 `docker compose up -d`，脚本依赖 `127.0.0.1:8080` 与 `.env` 中的 admin 凭据
+   - **v1.1.9/v1.1.10/v1.1.11 交互与数据面修复**：取消 Esc 收起、收起态改带文字紧凑面板；
+     任务列表默认**悬浮浮层**（永不消失，支持上传+下载任务、刷新后仍在 localStorage 还原）；
+     上传目标目录被删时**立即失败不重试**并按目录整批清理（实测把 291 次 404 风暴降到 14）
+   - **v1.1.12 功能体检套件**：`e2e/_ui-smoke.mjs` 端到端跑核心功能（登录/建目录/上传/预览/
+     重命名/搜索/分享/下载文件+文件夹/删除→回收站→恢复/各页面与接口），**33/33 通过**；
+     体检中发现并修复：任务面板 z-index(1200) 高于 antd 弹层(1050) → 盖住行内「更多」下拉菜单，
+     导致重命名/分享/下载/删除等行内操作失效（现已降为 900）
+     全部套件：`_ui-smoke` 33/33 · `_upload-resilience` 30/30 · `_ui-hash-check` ·
+     `_ui-float-download` · `_ui-dir-gone` · `_ui-upload-flow` · `_ui-dock-check` 均通过
+     注意：后台任务不继承提权，跑 Playwright 套件需前台 + danger-full-access
 
 ## 5. 实测基线（2026-08-24）
 

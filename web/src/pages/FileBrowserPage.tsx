@@ -15,15 +15,15 @@ import FileTable, { type FileAction } from '../components/FileTable';
 // 预览组件懒加载：pdfjs/xlsx/docx 等重型库仅在打开预览时加载，不进首屏
 const FilePreview = lazy(() => import('../components/FilePreview'));
 // 弹窗组件懒加载（打开时才加载对应 chunk，缩小首屏主包）
-const UploadQueue = lazy(() => import('../components/UploadQueue'));
-const UploadResumeButton = lazy(() => import('../components/UploadResumeButton'));
 const ShareModal = lazy(() => import('../components/ShareModal'));
 const PermissionModal = lazy(() => import('../components/PermissionModal'));
 const VersionModal = lazy(() => import('../components/VersionModal'));
 const MoveModal = lazy(() => import('../components/MoveModal'));
+// 上传队列面板 / 登录过期恢复入口：已提升到 MainLayout 全站挂载（切页不中断）
 import { useUploadStore } from '../store/upload';
 import { useIsMobile } from '../utils/useMediaQuery';
 import { getToken } from '../api/client';
+import { downloadToFile } from '../utils/downloader';
 import { warmupHash } from '../utils/hash';
 import { useAutoResume } from '../hooks/useAutoResume';
 
@@ -290,34 +290,34 @@ export default function FileBrowserPage() {
   const handleAction = async (action: FileAction, item: FileItem): Promise<void> => {
     switch (action) {
       case 'download': {
+        // v1.1.10：下载也进「上传/下载任务列表」，带进度、可取消/重试
         if (item.type === 'dir') {
-          // 文件夹：后端 zip 流式打包下载（鉴权接口，前端 fetch 存 Blob 保存）
-          try {
-            const res = await fetch(`/api/files/${item.id}/download-dir`, {
-              headers: { Authorization: 'Bearer ' + getToken() },
-            });
-            if (!res.ok) {
-              const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
-              throw new Error(err.message || '下载失败');
-            }
-            const blob = await res.blob();
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `${item.name}.zip`;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 30_000);
-            message.success('文件夹已打包下载');
-          } catch (e) {
-            message.error((e as Error).message);
-          }
+          // 文件夹：后端 zip 流式打包下载（鉴权接口，前端流式读取存 Blob 保存）
+          const zipName = `${item.name}.zip`;
+          useUploadStore.getState().addDownload({
+            name: zipName,
+            size: item.size ?? 0,
+            dirId: dirId ?? undefined,
+            fileId: item.id,
+            isDir: true,
+            run: (ctx) =>
+              downloadToFile(`/api/files/${item.id}/download-dir`, ctx, {
+                fileName: zipName,
+                headers: { Authorization: 'Bearer ' + getToken() },
+                jsonError: true,
+              }),
+          });
           break;
         }
         try {
           const res = await filesApi.download(item.id);
-          window.open(res.url, '_blank');
+          useUploadStore.getState().addDownload({
+            name: item.name,
+            size: item.size ?? 0,
+            dirId: dirId ?? undefined,
+            fileId: item.id,
+            run: (ctx) => downloadToFile(res.url, ctx, { fileName: item.name, knownSize: item.size ?? 0 }),
+          });
         } catch (e) {
           message.error((e as Error).message);
         }
@@ -604,8 +604,6 @@ export default function FileBrowserPage() {
         <PermissionModal target={permFile} onClose={() => setPermFile(null)} />
         <VersionModal file={versionFile} onClose={() => setVersionFile(null)} onRollback={() => void load()} />
         <MoveModal open={moveOpen} mode={moveMode} onCancel={() => setMoveOpen(false)} onConfirm={(t) => doMove(t)} />
-        <UploadQueue />
-        <UploadResumeButton />
       </Suspense>
       <Modal open={!!renameTarget} onCancel={() => setRenameTarget(null)} onOk={() => void doRename()} title="重命名" destroyOnHidden>
         <Form form={renameForm}>

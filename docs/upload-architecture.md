@@ -62,8 +62,9 @@
 
 ```
 queued → hashing → uploading → completed
+                          ↘ paused →(继续) → queued（断点续传）
                           ↘ auth-failed → (重新登录+继续上传) → queued（断点续传）
-                          ↘ error
+                          ↘ error → (自动重试 ≤3 轮 / 手动重试) → queued
 ```
 
 ### 2.5 时序图
@@ -141,16 +142,151 @@ queued → hashing → uploading → completed
   complete 后清理
 - **恢复分批**：`useAutoResume` 每批 50 + setTimeout(0) 让出主线程
 
-## 5. 关键文件
+## 5. 上传韧性：瞬时故障自愈 + 暂停/继续（v1.1.5）
+
+### 5.1 为什么需要（对应用户反馈）
+
+「上传偶发提示『请求失败，请稍后重试』，点一下重试又能成功」= **瞬时故障没有自愈**。
+常见来源：网络抖动、网关 5xx、429 限流、传输假死、**分片签名 URL 过期（403）**
+（旧实现一次性签全部分片 URL，大文件超过 `PRESIGN_EXPIRY`=1h 后后段 URL 必然失效）。
+
+### 5.2 错误分类与重试策略（`web/src/utils/retry.ts`）
+
+| 分类 | 触发 | 策略 |
+|---|---|---|
+| network | 断网/DNS/连接重置（`TypeError`、XHR onerror） | 自动重试（指数退避+抖动） |
+| timeout | 请求超时 / 传输 90s 无进度 | 自动重试 |
+| rate-limit | HTTP 429 | 自动重试 |
+| server | HTTP 5xx（含网关 502/503/504） | 自动重试 |
+| signature | 分片 PUT 403（签名过期） | **重新签发该分片 URL** 后重试 |
+| session-expired | 分片 PUT 404（MinIO 侧会话/分片丢失） | 作废本地会话 → 任务级重试重新 init |
+| quota | 507 空间不足 | 不重试（提示用户） |
+| auth | 401 登录态失效 | 不重试，交 `pauseForAuth` 全局治理 |
+| client | 其它 4xx（参数/权限/校验失败） | 不重试 |
+
+- **分片级**：最多 4 次重试；`PRESIGN_WINDOW=32` 按需签名；`PART_STALL_TIMEOUT=90s` 假死中断
+- **任务级**：瞬时故障仍失败 → 退避后自动重新排队，最多 3 轮（UI 标签「自动重试 N」），
+  成功后 `attempts` 归零
+- **进度准确性**：分片字节按「本次已达最大值」累计，重试同一分片不重复计数
+
+### 5.3 暂停 / 继续（AbortSignal）
+
+```
+pauseTask(id) / pauseAll()             resumeTask(id) / resumeAll()
+   ├─ controllers.get(id).abort()         ├─ 状态 paused → queued
+   ├─ uploader: PUT 中断 → 已传分片保留   ├─ queuedIds.push + pump
+   │   ├─ flushResumeWrites() 立即落盘    └─ uploader 命中 IndexedDB/服务端分片 → 只补缺失分片
+   │   └─ 返回 status='paused'（非错误）
+   └─ 状态 paused（不计入失败/完成）
+```
+
+- 队列级暂停标志 `paused + pauseReason`：`user`（用户全部暂停）/ `token_expired`（登录过期）
+- 单任务暂停时队列继续调度其它任务；全部暂停时停止调度
+- 交互：全选 + 暂停选中/继续选中；一键「全部暂停」/「全部继续」；最小化胶囊上也有一键暂停/继续
+
+### 5.4 并发正确性（两道令牌）
+
+| 机制 | 作用 |
+|---|---|
+| 运行令牌 `runTokens`（store） | 任务结算后，同轮在途分片的**迟到进度回调被丢弃**——否则会把状态改回「上传中」，导致自动重试被静默丢弃、进度条卡死 |
+| 写记录开关 `recordWrites`（uploader） | 会话失效/暂停后，兄弟分片迟到的 `onPartDone` **不再写断点记录**——否则会复活已作废会话，重试时按死会话续传（404 循环） |
+
+### 5.5 任务列表：悬浮浮层（默认）+ 下载任务（v1.1.10）
+
+- **默认悬浮浮层**：`position: fixed`（`z-index: 1200`）浮在网盘界面之上，可拖拽移动（位置持久化），
+  可最小化为浮层胶囊；**不响应点击外部/失焦/Esc**——操作网盘、切目录、开预览都不会让它消失
+- **形态可切换**：标题栏一键「悬浮 ⇄ 停靠右侧」（停靠=占位式，不覆盖文件列表），选择持久化
+- **列表持久化**（`localStorage: nd_task_list_v1`，节流 500ms）：
+  - 刷新/前进后退（整页重载）后列表仍在——旧实现内存队列会被清空，是"列表凭空消失"的主因之一
+  - 被打断的条目标记「已中断」：下载用持久化的 `fileId/isDir` 重建执行体可**一键重新下载**；
+    上传提示重新选择文件（≤8MB 由 IndexedDB 自动续传）
+- **上传 + 下载同一列表**：`kind='upload' | 'download'`
+  - 下载：`utils/downloader.ts` 流式读取（实时进度/可取消/可重试/落盘），并发 2，独立于上传队列
+  - 单文件走 MinIO 预签名直连；文件夹走 `/api/files/:id/download-dir`；>1.5GB 交还浏览器原生下载
+  - 暂停/继续只作用于上传任务（下载只能取消）
+- 顶栏固定入口 `UploadTaskButton`：显示 `已完成/总数 · 百分比` + 角标，任意页面开关面板
+- **nginx**：`index.html` 必须 `no-store`（否则升级后浏览器仍跑旧包，用户看到"修复没生效"）
+
+### 5.6 上传面板（历史形态）
+
+- **桌面端**：`MainLayout` 的 `<Layout hasSider>` 内、内容区右侧挂载 `UploadQueue`（渲染 antd `Sider`，宽 360px）
+  - **占位式**：占用布局宽度，**不覆盖文件列表**（与左侧空间导航对称）；无任务时整栏消失、内容区自动回满宽
+  - **收起态**（v1.1.9 起）为 **196px 带文字的紧凑面板**：进度 + 「全部暂停」/「全部继续」**常驻文字按钮**
+    （无可操作任务时置灰）+ 重试失败/清除已完成；**不再使用 48px 图标细栏**
+    （旧细栏按钮无文字、命中区小，用户既找不到按钮又容易误触暂停）
+  - **不使用 Esc 收起**（v1.1.9）：原全局 Escape 监听会在用户关预览/弹窗时把上传栏一起收起，
+    造成「点一下网盘界面，上传就隐藏了」的错觉；收起只由显式按钮触发
+  - 暂停/继续操作后弹出明确提示（已暂停 N 个、如何恢复、断点保留）
+  - 常驻栏内列表占满剩余高度并内部滚动（`.upload-dock .upload-panel__list`）
+- **移动端**（≤768px）：底部非模态面板（无遮罩，可继续操作页面）+ 进度胶囊
+- **顶栏固定入口** `UploadTaskButton`：显示 `已完成/总数 · 百分比` + 进行中角标（失败红标），任意页面展开/收起
+- **列表常驻**：任务存在期间不会消失——收起/最小化只切换形态；也**不再自动隐藏**
+  （旧行为 v1.1.5：全部成功后 2.5s 自动收起，用户点页面后就找不到列表，见 v1.1.6 修复）
+- **状态**：展开/收起由 store 的 `visible` + `panelCollapsed` 驱动并持久化；
+  `UploadQueue` 静态引入（参与布局，避免懒加载造成的宽度跳动）
+- 工具栏：全选 / 暂停选中 / 继续选中 / 全部暂停 / 全部继续 / 重试失败 / 清除已完成；总进度按文件大小加权
+
+## 6. 上传可靠性根因修复（v1.1.8）
+
+> 用户反馈：「上传偶发『请求失败，请稍后重试』，点一下重试又能成功」。真实浏览器复现 + 服务端日志定位到两个独立根因。
+
+### 6.1 根因一：客户端并发哈希串号（P0，数据正确性）
+
+```
+客户端 BLAKE3 Worker 池（web/src/utils/hash.ts）
+  旧实现：hashViaWorker(worker, segId, buf)  ← 用「分片序号」当请求关联 ID
+  问题：多个 >8MB 文件并发哈希共用同一 worker 池；
+        EventTarget 监听器会收到该 worker 的**每一条**消息，且按 id 匹配
+        → 文件 A 的 seg0 回复把同样在等 seg0 的文件 B 一并 resolve
+        → 两个文件内容哈希互相串号 → 客户端上报错误哈希
+        → 服务端 completeUpload 重算 BLAKE3(B3SEG) 不一致 → 400「文件哈希校验失败，已终止上传」
+        → 界面「请求失败，请稍后重试」；单文件重试（不再并发）即可成功
+  为何只有大文件：≤8MB 走主线程单例哈希（init/update/digest 无 await，原子）
+  修复：请求 ID 改为全局单调递增（与分片序号解耦，一问一答严格对应）
+```
+
+### 6.2 根因二：暂停后「全部继续」永久卡在「上传中」
+
+```
+旧流程：暂停 → uploader 只中断了分片 PUT（XHR），**未中断** init/presign/complete（JSON 接口）
+        → 服务端其实已完成合并并落库；客户端却因任务被标记 suspended/paused
+          在 store .then 中直接 return（丢弃「已完成」）→ 任务永远停在上传中
+        → 恢复后再次 complete 撞 MinIO NoSuchUpload → 500 → 卡死
+修复（三层防御）：
+  1) api()/uploadInit/presignParts/completeUpload 支持 AbortSignal：暂停同步中断接口
+  2) 服务端 complete 幂等自愈：NoSuchUpload 且对象已存在且大小一致 → 视为已完成继续落库
+  3) 客户端 complete 失败自愈：init 校验内容是否已落库（命中去重即成功）；
+     store「先判成功、再判暂停」——真实完成的结果不再被暂停标记吞掉
+附带：complete 缺分片清单不再 abortMultipart（不销毁可恢复分片）；
+     服务端占位分片（'server'，无 ETag）必须真实重传
+```
+
+### 6.3 回归测试（真实浏览器 Playwright + 本机 Edge）
+
+| 脚本 | 覆盖 | 结果 |
+|---|---|---|
+| `e2e/_ui-hash-check.mjs` | 并发哈希 vs 串行基准（3 文件 / 8 文件压力） | ✅ 逐一致 |
+| `e2e/_ui-upload-flow.mjs` | 40MB 单文件 / 暂停→继续 / 立即继续 / 3 文件并发（抓取所有 4xx-5xx） | ✅ 零非预期失败 |
+| `e2e/_ui-dock-check.mjs` | 常驻栏占位布局/命中测试/4 种窗口宽度/细栏/顶栏入口/全部暂停恢复/控制台无错误 | ✅ |
+| `e2e/_upload-resilience.ts` | 逻辑层 25 项（退避重试/断点/暂停） | ✅ 25/25 |
+| `e2e/_cleanup-tests.mjs` | 测试数据清理（软删 → purge，因 purge 只对已删除目标生效） | ✅ |
+
+## 7. 关键文件
 
 - `web/src/utils/token-refresh.ts`：主动续期核心（解码/定时/并发锁/退避）
 - `web/src/hooks/useVisibilityCheck.ts`：切前台检测
-- `web/src/api/client.ts`：401 拦截器 → 刷新 → 暂停
-- `web/src/store/upload.ts`：auth-failed 状态 + pauseForAuth/resumeAuth
+- `web/src/api/client.ts`：401 拦截器 → 刷新 → 暂停；上传二进制错误结构化（HttpStatusError）；支持 AbortSignal
+- `web/src/utils/retry.ts`：错误分类 + 指数退避 + 可中断 sleep（v1.1.5）
+- `web/src/utils/hash.ts`：BLAKE3 分片哈希（worker 池 + `__ndFileHash` 测试钩子；v1.1.8 修复并发串号）
+- `web/src/store/upload.ts`：状态机 + 暂停/继续/批量暂停 + 运行令牌 + 任务级自动重试（v1.1.5/1.1.8）
+- `web/src/components/UploadQueue.tsx`：任务列表（悬浮浮层/浮层胶囊/停靠栏；上传+下载）
+- `web/src/utils/downloader.ts`：流式下载引擎（进度/取消/落盘/超大文件直连，v1.1.10）
+- `web/src/components/UploadTaskButton.tsx`：顶栏固定「上传任务」入口（进度/角标，v1.1.6）
 - `web/src/components/UploadResumeButton.tsx`：恢复入口
-- `web/src/utils/metrics.ts`：interrupt_reason 埋点
-- `web/src/utils/resume-store.ts`：断点续传 IndexedDB 持久化（3.1）
-- `web/src/utils/uploader.ts`：三级续传引擎（IndexedDB→服务端→localStorage）
-- `web/src/hooks/useAutoResume.ts`：页面加载自动恢复（3.3）
+- `web/src/utils/metrics.ts`：interrupt_reason 埋点（token_expired / user_paused / auto_retry / session_expired）
+- `web/src/utils/resume-store.ts`：断点续传 IndexedDB 持久化（3.1）+ `flushResumeWrites` 立即刷盘（v1.1.5）
+- `web/src/utils/uploader.ts`：三级续传引擎（IndexedDB→服务端→localStorage）+ 自动重试/按需签名/暂停中断（v1.1.5）
+- `web/src/hooks/useAutoResume.ts`：页面加载自动恢复（3.3 + mode1Pending 补 complete）
+- `e2e/_upload-resilience.ts`：上传韧性测试（伪造 XHR/fetch，25 项断言，v1.1.5）
 - 后端：`server/src/routes/auth.ts` `/refresh`（cookie refresh_token，免鉴权）
 - 后端：`server/src/routes/files.ts` `/upload/parts-report` + `/upload/parts`（3.2）

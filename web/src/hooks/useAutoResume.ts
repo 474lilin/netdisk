@@ -17,8 +17,12 @@ export function useAutoResume(): void {
     void (async () => {
       try {
         const records = await loadResumeRecords();
-        // 仅恢复带 File 引用（小文件）且未完成的分片会话；避免重复恢复已完成记录
-        const resumeable = records.filter((r) => r.file && r.size <= FILE_PERSIST_LIMIT && r.totalParts > 1);
+        // 仅恢复带 File 引用（小文件）且未完成的会话：
+        //   - 分片会话（totalParts > 1）：续传缺失分片
+        //   - 单请求直传已 PUT 待 complete（mode1Pending，v1.1.5）：直接补 complete，秒级完成
+        const resumeable = records.filter(
+          (r) => r.file && r.size <= FILE_PERSIST_LIMIT && (r.totalParts > 1 || r.mode1Pending)
+        );
         if (resumeable.length === 0) return;
         // 去重：同一文件只入队一次
         const seen = new Set<string>();

@@ -1,5 +1,6 @@
 // 主布局：侧边栏（空间导航 + 功能入口）+ 顶栏（搜索 + 用户）+ 内容区（移动端响应式）
-import { useEffect, useState } from 'react';
+// v1.1.5：上传队列面板 + 登录过期恢复入口 提升到布局层（任意页面可见；面板为不遮挡页面的悬浮卡片）
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Layout, Menu, Input, Dropdown, Avatar, Space, Tag, Button } from 'antd';
 import {
   GlobalOutlined,
@@ -17,6 +18,7 @@ import {
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { orgApi } from '../../api';
 import { useAuthStore } from '../../store/auth';
+import { hydrateTaskList } from '../../store/upload';
 import type { OrgRoot } from '../../api/types';
 import { ROLE_NAMES } from '../../api/types';
 import { useIsMobile } from '../../utils/useMediaQuery';
@@ -24,6 +26,13 @@ import { startTokenRefreshTimer, trackToken } from '../../utils/token-refresh';
 import { useVisibilityCheck } from '../../hooks/useVisibilityCheck';
 
 const { Sider, Header, Content } = Layout;
+
+// 登录过期的恢复入口（懒加载）
+const UploadResumeButton = lazy(() => import('../UploadResumeButton'));
+// 上传任务右侧常驻栏（占位式，随布局伸缩；桌面端为 Sider，移动端为底部浮层）
+import UploadQueue from '../UploadQueue';
+// 顶栏固定入口（体积极小，直接静态引入，保证任何时刻都能打开任务列表）
+import UploadTaskButton from '../UploadTaskButton';
 
 const ROOT_ICONS: Record<string, React.ReactNode> = {
   user: <UserOutlined />,
@@ -42,6 +51,10 @@ export default function MainLayout() {
 
   // v1.0.13：登录态下启动 Token 主动续期定时器 + 切前台检测（长耗时上传防 Token 过期）
   useVisibilityCheck();
+  // v1.1.10：还原上次（刷新/前进后退前）的任务列表——列表不会因整页重载而凭空消失
+  useEffect(() => {
+    hydrateTaskList();
+  }, []);
   useEffect(() => {
     if (!user) return;
     trackToken();
@@ -180,21 +193,32 @@ export default function MainLayout() {
               allowClear
             />
           </Space>
-          <Dropdown menu={userMenu} placement="bottomRight">
-            <Space style={{ cursor: 'pointer' }}>
-              <Avatar size="small" style={{ background: '#1677ff' }} icon={<UserOutlined />} />
-              {!isMobile && <span>{user?.displayName || user?.username}</span>}
-              {!isMobile && (
-                <Tag color={user?.role === 1 ? 'gold' : user?.role === 2 ? 'blue' : 'default'}>
-                  {user ? ROLE_NAMES[user.role] : ''}
-                </Tag>
-              )}
-            </Space>
-          </Dropdown>
+          {/* 固定的「上传任务」入口：任务列表常驻，收起/最小化后也能一键打开（v1.1.6） */}
+          <Space size={4}>
+            <UploadTaskButton />
+            <Dropdown menu={userMenu} placement="bottomRight">
+              <Space style={{ cursor: 'pointer' }}>
+                <Avatar size="small" style={{ background: '#1677ff' }} icon={<UserOutlined />} />
+                {!isMobile && <span>{user?.displayName || user?.username}</span>}
+                {!isMobile && (
+                  <Tag color={user?.role === 1 ? 'gold' : user?.role === 2 ? 'blue' : 'default'}>
+                    {user ? ROLE_NAMES[user.role] : ''}
+                  </Tag>
+                )}
+              </Space>
+            </Dropdown>
+          </Space>
         </Header>
-        <Content style={{ overflow: 'auto', padding: isMobile ? 8 : 16 }}>
-          <Outlet />
-        </Content>
+        {/* 内容区 + 右侧上传常驻栏（v1.1.7：占位式，不覆盖文件列表；无任务时自动消失） */}
+        <Layout hasSider>
+          <Content style={{ overflow: 'auto', padding: isMobile ? 8 : 16 }}>
+            <Suspense fallback={null}>
+              <UploadResumeButton />
+            </Suspense>
+            <Outlet />
+          </Content>
+          <UploadQueue />
+        </Layout>
       </Layout>
     </Layout>
   );

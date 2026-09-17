@@ -95,15 +95,17 @@ export const filesApi = {
   remove: (targets: TargetRef[]) => api<{ ok: boolean; count: number }>('/api/files/delete', { method: 'POST', body: { targets } }),
   restore: (targets: TargetRef[]) => api<{ ok: boolean; count: number }>('/api/files/restore', { method: 'POST', body: { targets } }),
   purge: (targets: TargetRef[]) => api<{ ok: boolean; count: number }>('/api/files/purge', { method: 'POST', body: { targets }, timeout: 10 * 60 * 1000 }), // 大目录硬删可能较久（10 分钟）
-  uploadInit: (data: { dirId: string; name: string; size: number; hash?: string; sha256?: string; mimeType?: string }) =>
-    api<UploadInitResult>('/api/files/upload/init', { method: 'POST', body: data }),
-  presignParts: (sessionId: string, partNumbers: number[]) =>
+  // v1.1.8：上传相关接口支持传入任务中断信号（暂停时同步中断请求，避免“暂停了但服务端仍在完成”）
+  uploadInit: (data: { dirId: string; name: string; size: number; hash?: string; sha256?: string; mimeType?: string }, signal?: AbortSignal) =>
+    api<UploadInitResult>('/api/files/upload/init', { method: 'POST', body: data, signal }),
+  presignParts: (sessionId: string, partNumbers: number[], signal?: AbortSignal) =>
     api<{ parts: Array<{ partNumber: number; url: string; expires: number }> }>('/api/files/upload/presign-parts', {
       method: 'POST',
       body: { sessionId, partNumbers },
+      signal,
     }),
-  completeUpload: (sessionId: string, parts?: Array<{ partNumber: number; etag: string }>) =>
-    api<FileItem>('/api/files/upload/complete', { method: 'POST', body: { sessionId, parts } }),
+  completeUpload: (sessionId: string, parts?: Array<{ partNumber: number; etag: string }>, signal?: AbortSignal) =>
+    api<FileItem>('/api/files/upload/complete', { method: 'POST', body: { sessionId, parts }, signal }),
   abortUpload: (sessionId: string) => api<{ ok: boolean }>('/api/files/upload/abort', { method: 'POST', body: { sessionId } }),
   uploadedParts: (sessionId: string) => api<{ parts: number[] }>(`/api/files/upload/session/${sessionId}/parts`),
   download: (id: string) => api<{ url: string }>(`/api/files/${id}/download`),

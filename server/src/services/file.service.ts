@@ -1270,19 +1270,42 @@ export async function completeUpload(user: AuthedUser, sessionId: string, client
   } else {
     // 分片：客户端回传各分片 ETag（来自 PUT 响应头），MinIO 侧校验一致性
     if (!clientParts || clientParts.length === 0) {
-      await abortMultipart(session.object_key, session.upload_id);
+      // 注意：不再 abortMultipart——客户端可能只是「分片清单为空」（服务端占位分片/并发竞态），
+      // 中止会销毁仍可恢复的分片数据；会话交由每日定时任务清理。
       throw ApiError.badRequest('缺少已上传分片信息');
     }
     const parts = [...clientParts].sort((a, b) => a.partNumber - b.partNumber);
-    const result = await completeMultipart(
-      session.object_key,
-      session.upload_id,
-      parts.map((p) => ({ partNumber: p.partNumber, etag: p.etag }))
-    );
-    etag = result.etag;
-    const stat = await statObject(session.object_key);
-    size = stat.size;
-    versionId = stat.versionId;
+    try {
+      const result = await completeMultipart(
+        session.object_key,
+        session.upload_id,
+        parts.map((p) => ({ partNumber: p.partNumber, etag: p.etag }))
+      );
+      etag = result.etag;
+      const stat = await statObject(session.object_key);
+      size = stat.size;
+      versionId = stat.versionId;
+    } catch (err) {
+      // 幂等自愈（v1.1.8）：NoSuchUpload = 该 uploadId 在 MinIO 侧已不存在，
+      // 常见于「重复 complete」——客户端暂停/超时后重试、网络重发、并发提交。
+      // 若对象已存在且大小与声明一致，说明分片其实已合并成功 → 视为已完成继续落库，
+      // 而不是返回 500 让任务永久失败（这正是用户看到的「上传卡住 / 服务内部错误」）。
+      const code = (err as { code?: string }).code;
+      const st = code === 'NoSuchUpload' ? await statObject(session.object_key).catch(() => null) : null;
+      const declared = Number(session.file_size);
+      if (st && (declared === 0 ? st.size > 0 : st.size === declared)) {
+        logger.warn('completeUpload: NoSuchUpload 但对象已存在，按已完成处理', {
+          session: session.id,
+          key: session.object_key,
+          size: st.size,
+        });
+        etag = st.etag;
+        size = st.size;
+        versionId = st.versionId;
+      } else {
+        throw err;
+      }
+    }
   }
 
   // 大小校验：客户端声明的大小必须与实际一致（PG BIGINT 返回为字符串，需归一为数字）

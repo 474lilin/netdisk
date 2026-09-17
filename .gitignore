@@ -32,6 +32,7 @@ minio-data-backup*/
 
 # ===== 测试脚本（本地专用，含路径/凭据读取）=====
 e2e/_*.mjs
+e2e/tmp/
 deploy/scripts/_*.mjs
 deploy/scripts/tmp/
 deploy/scripts/smoke-*.mjs

@@ -27,9 +27,186 @@ body,
   white-space: nowrap;
 }
 
-/* 上传队列 */
+/* ---------- 上传/下载任务列表（v1.1.10）
+   默认「悬浮浮层」：fixed 定位浮在网盘界面之上，可拖拽、可最小化为浮层胶囊，
+   只要还有任务就一定显示某种形态（操作网盘/切页/按 Esc 都不会消失）；
+   可选「停靠右侧」：占位式，不覆盖文件列表 ---------- */
+
+/* 悬浮浮层（默认）
+   z-index 必须低于 antd 弹层（modal 1000 / dropdown 1050 / tooltip 1070）——
+   否则面板会盖住行内「更多」下拉菜单等弹层，点菜单项会点到面板上（v1.1.12 实测修复） */
+.upload-float {
+  position: fixed;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  width: 380px;
+  max-height: min(70vh, 560px);
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 10px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+}
+
+/* 浮层收起后的小胶囊（仍浮在页面上，永不消失） */
+.upload-float-pill {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 999px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
+}
+
+/* 停靠模式：右侧占位常驻栏 */
+.upload-dock {
+  background: #fff;
+  border-left: 1px solid #f0f0f0;
+}
+
+.upload-dock .ant-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* 收起态（v1.1.9）：带文字的紧凑面板（替代 48px 图标细栏，避免按钮找不到/误触） */
+.upload-dock__mini {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.upload-dock__mini-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 8px 10px 6px;
+  background: #fafafa;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.upload-dock__mini-body {
+  padding: 10px;
+}
+
+.upload-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 6px;
+  background: #fafafa;
+  border-bottom: 1px solid #f0f0f0;
+  user-select: none;
+  cursor: move; /* 悬浮模式下拖动标题栏移动面板 */
+  touch-action: none;
+}
+
+/* 停靠模式标题栏不需要拖拽手势 */
+.upload-dock .upload-panel__header {
+  cursor: default;
+  touch-action: auto;
+}
+
+/* 总进度条（列表内每条任务的进度不受影响） */
+.upload-overall-progress {
+  padding: 0 10px;
+}
+
+.upload-panel__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 10px 8px;
+}
+
+.upload-panel__list {
+  flex: 1 1 auto;
+  min-height: 120px;
+  max-height: 40vh;
+  overflow: auto;
+  padding: 0 10px;
+}
+
+/* 常驻栏内：列表占满剩余高度并内部滚动 */
+.upload-dock .upload-panel__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.upload-panel__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px 6px;
+  border-top: 1px solid #f5f5f5;
+}
+
+/* ---------- 移动端：底部非模态面板 ---------- */
+.upload-panel {
+  position: fixed;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  max-height: min(72vh, 560px);
+  background: #fff;
+  border: 1px solid #f0f0f0;
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
+  overflow: hidden;
+}
+
 .upload-queue .ant-list-item {
   padding: 8px 0;
+}
+
+/* 最小化后的进度胶囊：不遮挡页面，可随时展开 */
+.upload-panel-pill {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #fff;
+  border: 1px solid #f0f0f0;
+  border-radius: 999px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.14);
+}
+
+.upload-panel-pill__text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: rgba(0, 0, 0, 0.75);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.upload-panel-pill__speed {
+  color: #1677ff;
+}
+
+.upload-panel-pill__fail {
+  color: #ff4d4f;
 }
 
 /* 拖拽上传覆盖层 */
@@ -163,5 +340,23 @@ body,
   /* 上传队列列表行更紧凑 */
   .upload-queue .ant-list-item {
     padding: 6px 0;
+  }
+  /* 移动端：上传任务列表改为底部非模态面板（无遮罩，页面仍可操作） */
+  .upload-panel {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    top: auto;
+    width: auto;
+    max-height: 64vh;
+  }
+  .upload-panel__list {
+    max-height: 40vh;
+  }
+  .upload-panel-pill {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    justify-content: space-between;
   }
 }
