@@ -26,9 +26,18 @@ export function useAutoResume(): void {
         if (resumeable.length === 0) return;
         // 去重：同一文件只入队一次
         const seen = new Set<string>();
+        // 任务列表里已存在同一文件的任务（刷新前的中断任务）→ 不再新建重复条目：
+        // 这类任务由 hydrateTaskList 直接用 IndexedDB 里的 File 自动续传（v1.1.13），
+        // 否则会出现「一个自动续传的新任务 + 一个失败的旧任务」两条记录。
+        const existing = new Set(
+          Object.values(useUploadStore.getState().tasks)
+            .filter((t) => t.kind !== 'download' && t.status !== 'completed' && t.status !== 'dedup')
+            .map((t) => `${t.dirId}\u0000${t.fileName}\u0000${t.size}`)
+        );
         const unique = resumeable.filter((r) => {
           if (seen.has(r.key)) return false;
           seen.add(r.key);
+          if (existing.has(`${r.dirId}\u0000${r.fileName}\u0000${r.size}`)) return false;
           return true;
         });
         let restored = 0;

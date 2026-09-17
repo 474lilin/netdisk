@@ -4,6 +4,88 @@
 > 运维排查见 `docs/03-运维手册.md`，续接开发见 `RESUME.md`。
 > 格式遵循 Keep a Changelog；版本 `v1.0.x` 为私有化发布序列。
 
+## [v1.1.13] - 2026-09-17
+
+### 修复「刷新浏览器后，失败的上传任务点重试没反应」
+
+#### 现场（用户提问：「上传失败的任务还是需要不断地点击重试？刷新浏览器后失败任务不能重新上传，
+点『重试』和『重试失败』两个按钮均没有反应」）
+用户描述的是**两个独立问题叠加**，实测把两者都定位到了：
+
+**问题一（用户没提，但是真凶）：存储盘写满，MinIO 拒绝一切写入**
+- `N:` 盘 200GB **100% 占满**（仅剩 6MB）；而 MinIO 的数据目录正是宿主机 bind mount
+  `N:\minio-data-single` → 容器 `/data1`（`minio server /data1`）。
+- 服务端日志近 7 天 **2252 次** `XMinioStorageFull: Storage backend has reached its minimum
+  free drive threshold`，全部发生在 `initUpload`（`POST /api/files/upload/init`）。
+  → **任何上传都会在第一步就被存储后端拒绝**，这才是「上传任务失败了一部分」的根因。
+- MinIO 侧统计：`137 GiB Used / 31634 Objects / 52687 Versions / 18322 Delete Markers`，
+  而数据库里存活文件只有 2587 个（67GB，其中 58GB 在去重池）——
+  空间主要被**历史版本 + 删除标记**占据（版本控制自 8/26 数据恢复起一直开着）。
+- 处置（经用户确认）：把 14.5GB 陈旧备份目录 `N:\minio-data-backup-20260826` 移到 `E:`（不删除）+
+  清理 MinIO 未完成分片上传、非当前版本与删除标记；清理前已 `pg_dump` 备份到 `E:\netdisk-backups\`。
+
+**问题二（用户点的那两个按钮）：刷新后重试是「静默空操作」**
+- 任务列表持久化在 localStorage（`nd_task_list_v1`），刷新后由 `hydrateTaskList()` 还原；
+  但 **File 对象无法持久化** → 还原出来的上传任务 `file` 为 `undefined`。
+- 旧实现点「重试」/「重试失败」会把这些任务重新置为 `queued` 并 `pump()`：
+  `runUploadTask` 第一行 `resumeKey(dirId, file.name, file.size)` 读 `file.name` **抛 TypeError**，
+  被 catch 后立刻写回 `error` —— 几十毫秒内状态来回跳一次，
+  用户看到的就是「点了没反应」（旧文案还错误地宣称「≤8MB 的小文件会自动续传」）。
+- 另一个隐性死路：若队列处于 `paused`（登录过期/目录失效自动暂停），`retryTask` 完全不解除暂停，
+  任务被置为 `queued` 后永远不启动，同样是「没反应」。
+
+#### 修复内容
+1. **缺文件的任务不再假装重试**：`UploadTask.needsFile` 标记 + `NEEDS_FILE_MSG` 文案；
+   `pump()` 增加防御（无本地 File 的上传任务绝不下发给执行体）；
+   任务行上的「重试」按钮换成 **「重新选择文件」**（文件夹图标）。
+2. **选回文件 → 真断点续传**：新增 `attachFile(id, file)`，
+   校验**文件名 + 大小**（续传记录按「目录+文件名+大小」索引，不一致无法续传）并给出明确错误；
+   同时持久化 `lastModified`，修改时间不一致时提示"内容若已改动请移除后重传"。
+   选回后上传引擎命中 IndexedDB/服务端分片，**只补缺失分片**（实测复用刷新前的同一个 sessionId）。
+3. **「重试失败」批量按钮**：先弹文件选择框（多选），按 名称+大小 自动配对；
+   剩余没配上的用 message 列名提示，再去重试那些"有本地文件"的普通失败任务。
+4. **`retryTask` / `retryAllFailed` 解除队列暂停**（登录过期 `token_expired` 除外，需先重新登录），
+   不再出现"置为排队但永不启动"。
+5. **小文件（≤8MB）自动续传不再产生重复任务**：`hydrateTaskList` 会用 IndexedDB 里保存的 File
+   直接续传原任务；`useAutoResume` 跳过任务列表里已存在的同一文件（旧实现会额外新建一条重复任务）。
+
+#### 顺带修掉的「断点续传静默失效」缺陷（测试中实测发现）
+`web/src/utils/resume-store.ts`（IndexedDB 断点记录）有两处真实缺陷，会让整个续传能力
+**静默降级到 localStorage**（File 引用无法序列化 → 刷新后小文件不再自动续传、断点信息不完整）：
+1. **固定版本号打开数据库**：历史实现一律 `indexedDB.open('nd-resume-db', 1)`；
+   一旦库版本被升过（自愈/其它工具），之后每次打开都会 `VersionError` → 永久降级。
+   修复：改为**不带版本号**打开（沿用现有版本），仅在自愈升版本时才显式指定版本。
+2. **库存在但缺少对象存储时无法自愈**：同名库若被其它工具创建过（无 `sessions` 存储），
+   只靠 `onupgradeneeded` 永远补不上（事务一直 `NotFoundError`）。
+   修复：检测到存储缺失时**升一个版本重开**强制重建（最多 3 次），并打印 `[resume]` 告警。
+3. 新增调试钩子 `window.__resumeDebug()`（与 `window.__uploadStore` 同风格）：
+   现场排查"刷新后为什么不续传"时可直接看 `idbUnavailable / dbVersion / pendingWrites`。
+
+实测（`e2e/_probe-resume-idb.mjs`）：先注入「v1 且无 sessions 存储」的污染库，再上传 24MB；
+修复前 `idbUnavailable=true`、记录写进 localStorage（`ls=1`）；
+修复后 `dbVersion=2 / idbUnavailable=false`，分片断点记录正常写入 IndexedDB（`ls=0`），完成时自动清理。
+
+#### 验证
+- `e2e/_ui-retry-after-refresh.mjs`（新增，真实浏览器 + 真实刷新）：
+  2 个 40MB + 1 个 6MB 文件上传中刷新页面 → 大文件标记「需要重新选择文件」→
+  直接调 `retryTask` 不再排队（回归断言）→ 点任务上的「重新选择文件」选回同一文件续传完成 →
+  点「重试失败」弹框选回文件续传完成 → 小文件自动续传且只有一条任务 → 服务端落库大小一致。
+- `e2e/_probe-resume-idb.mjs`（新增）：断点记录写入 IndexedDB 的时间线（含污染库自愈场景）。
+- `e2e/_verify-storage-integrity.mjs`（新增）：清理 MinIO 历史版本后的**存储完整性核验**——
+  2587 个存活文件逐个校验对象可读（2586 通过，1 个是测试脚本 BOM 造成的接口 500，与数据无关）、
+  抽样 20 个完整下载并按 **B3SEG** 复核哈希与大小（20/20 一致，含 369MB 视频）。
+  注意：数据库里名为 `sha256` 的列实际存的是 **B3SEG 内容哈希**（`BLAKE3(BLAKE3(seg0)||...)`），
+  用标准 SHA-256 复核会得出"全都不一致"的错误结论。
+- 关键文件：`web/src/store/upload.ts`、`web/src/components/UploadQueue.tsx`、
+  `web/src/utils/filePicker.ts`（新增）、`web/src/utils/resume-store.ts`（加固）、
+  `web/src/hooks/useAutoResume.ts`
+
+#### 运维教训（已写入 `RESUME.md`）
+MinIO **版本控制开着**时，「删除文件」只是打删除标记，空间不会释放；
+`mc rm --recursive --force --versions --non-current` 才能回收。
+存储盘剩余空间低于 MinIO 的 `minimum free drive threshold`（默认 5%）后，
+**所有上传都会失败**（`XMinioStorageFull`），必须优先看磁盘。
+
 ## [v1.1.12] - 2026-09-14
 
 ### 网盘功能全面体检 + 修复「任务面板盖住行内下拉菜单」

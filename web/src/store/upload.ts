@@ -1,4 +1,4 @@
-// 上传/下载任务队列（v1.1.10 起统一管理上传与下载）
+﻿// 上传/下载任务队列（v1.1.10 起统一管理上传与下载）
 // 万级任务性能：tasks 用 Map 存储，状态更新 O(1)（数组 map 在 2 万任务时每次更新拖垮主线程）；
 // 派生数组仅在上传面板/完成判定处 useMemo 计算
 // v1.0.13：Token 过期治理——auth-failed 状态 + 队列暂停/恢复（401 时暂停，登录后继续）
@@ -9,11 +9,12 @@
 // v1.1.10：同一列表管理**下载任务**（kind='download'）：下载中/完成/失败/取消，可重试；
 //          下载不参与上传的暂停/恢复（只能取消），并发上限 2
 import { create } from 'zustand';
-import { runUploadTask, type UploadTaskInput } from '../utils/uploader';
+import { runUploadTask, resumeKey, type UploadTaskInput } from '../utils/uploader';
 import { downloadToFile, type DownloadCtx } from '../utils/downloader';
 import { filesApi } from '../api';
 import { reportUploadInterrupt } from '../utils/metrics';
 import { backoffDelay, isAbortError } from '../utils/retry';
+import { FILE_PERSIST_LIMIT, loadResumeRecord } from '../utils/resume-store';
 
 export type TaskKind = 'upload' | 'download';
 
@@ -49,6 +50,14 @@ export interface UploadTask extends UploadTaskInput {
   /** 下载来源（用于刷新后重建 run，可重试）：文件 id / 是否文件夹 */
   fileId?: string;
   isDir?: boolean;
+  /**
+   * 缺少本地文件引用（v1.1.13）：刷新/重开页面后还原的上传任务必然如此
+   *（浏览器不允许把 File 对象写进 localStorage）。这类任务**必须由用户重新选择同一个文件**
+   * 才能继续（已传分片保留在服务端，可选回同名同大小的文件断点续传）。
+   */
+  needsFile?: boolean;
+  /** 本地文件最后修改时间（持久化，用于重选文件时校验是否为同一个文件） */
+  lastModified?: number;
 }
 
 // 并发上限：小文件（单请求直传，网络往返为主）可高并发；大文件（分片上传 + 哈希/带宽开销大）保守
@@ -98,6 +107,14 @@ interface UploadState {
   retryTask: (id: string) => void;
   /** 批量重试全部失败任务（v1.1.5） */
   retryAllFailed: () => void;
+  /**
+   * 给「刷新后需要重选文件」的任务补上本地文件引用并立刻重新入队（v1.1.13）。
+   * 会校验 文件名+大小（续传记录按「目录+文件名+大小」索引，不一致无法续传）；
+   * 修改时间不一致时仍可继续，但返回 warning 供 UI 提示。
+   */
+  attachFile: (id: string, file: File) => { ok: boolean; reason?: string; warning?: string };
+  /** 当前需要重新选择本地文件的失败任务 id（供 UI 决定是否弹文件选择框） */
+  needsFileIds: () => string[];
   /** 暂停单个任务（v1.1.5）：中断在传请求，保留断点 */
   pauseTask: (id: string) => void;
   /** 继续单个任务（v1.1.5）：重新入队，断点续传 */
@@ -200,6 +217,34 @@ let tokenSeq = 0;
 const dirGoneCounts = new Map<string, number>();
 const DIR_GONE_PAUSE_THRESHOLD = 3;
 
+/** 体积格式化（错误文案用，避免引入 UI 层依赖） */
+function fmtSize(n: number): string {
+  if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(2) + ' GB';
+  if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+/** 「刷新后需要重新选择本地文件」的提示文案（v1.1.13） */
+export const NEEDS_FILE_MSG =
+  '页面刷新后本地文件引用已丢失：点「重新选择文件」选回同一个文件即可断点续传（已传分片保留在服务端）';
+
+/**
+ * 标记任务「缺少本地文件引用」（v1.1.13）。
+ * 旧实现的致命缺陷：这类任务被排队后，runUploadTask 里执行 `file.name` 抛 TypeError，
+ * 任务在几十毫秒内又变回「失败」——用户看到的就是「点重试/重试失败都没反应」。
+ * 现在一律不再排队，而是明确要求用户重选文件。
+ */
+function markNeedsFile(id: string): void {
+  useUploadStore.setState((s) => {
+    const t = s.tasks[id];
+    if (!t || t.kind === 'download') return {};
+    return {
+      tasks: { ...s.tasks, [id]: { ...t, status: 'error' as UploadTaskStatus, needsFile: true, retrying: false, error: NEEDS_FILE_MSG } },
+    };
+  });
+}
+
 async function pump(): Promise<void> {
   // 填槽：循环从 FIFO 取任务启动，直到达到当前并发上限
   for (;;) {
@@ -214,6 +259,11 @@ async function pump(): Promise<void> {
       queuedIds.shift();
       const t = useUploadStore.getState().tasks[id];
       if (!t || t.status !== 'queued') continue;
+      // 防御（v1.1.13）：刷新后还原的上传任务没有本地 File 引用，绝不能下发给上传执行体
+      if (t.kind !== 'download' && !t.file) {
+        markNeedsFile(id);
+        continue;
+      }
       const controller = new AbortController();
       controllers.set(id, controller);
       running += 1;
@@ -462,6 +512,7 @@ export const useUploadStore = create<UploadState>((set, get) => ({
         size: file.size,
         dirId,
         file,
+        lastModified: file.lastModified,
         status: 'queued',
         progress: 0,
         bytesDone: 0,
@@ -496,63 +547,135 @@ export const useUploadStore = create<UploadState>((set, get) => ({
   retryTask: (id) => {
     const t = get().tasks[id];
     if (!t) return;
+    if (t.kind === 'download') {
+      set((s) => ({
+        tasks: {
+          ...s.tasks,
+          [id]: { ...s.tasks[id], status: 'queued', progress: 0, bytesDone: 0, error: undefined, interruptReason: undefined, attempts: 0, retrying: false },
+        },
+      }));
+      pumpDownloads(); // 下载：重新执行 run()
+      return;
+    }
+    // 刷新后还原的任务没有本地 File：排队只会在执行体里抛错（旧版表现为"点了没反应"）
+    if (!t.file) {
+      markNeedsFile(id);
+      return;
+    }
     set((s) => ({
       tasks: {
         ...s.tasks,
         [id]: {
           ...s.tasks[id],
           status: 'queued',
-          progress: s.tasks[id].kind === 'download' ? 0 : s.tasks[id].progress,
-          bytesDone: s.tasks[id].kind === 'download' ? 0 : s.tasks[id].bytesDone,
           error: undefined,
           interruptReason: undefined,
           attempts: 0,
           retrying: false,
         },
       },
+      // 用户显式点「重试」= 想继续传：解除暂停（登录过期需先重新登录，保持暂停由 UI 引导）
+      ...(s.paused && s.pauseReason !== 'token_expired' ? { paused: false, pauseReason: undefined } : {}),
     }));
-    if (t.kind === 'download') {
-      pumpDownloads(); // 下载：重新执行 run()
-      return;
-    }
+    if (get().paused) return; // 仍处于暂停（登录过期）：只改状态，不起调度
     requeue(id);
+    updateLimit(get().tasks);
     void pump();
   },
 
-  // 一键重试全部失败任务（v1.1.5；v1.1.10 含下载）
+  // 一键重试全部失败任务（v1.1.5；v1.1.10 含下载；v1.1.13 处理"刷新后缺文件"的任务）
   retryAllFailed: () => {
     const ids: string[] = [];
     set((s) => {
       const next: Record<string, UploadTask> = {};
+      let errorCount = 0;
       for (const [id, t] of Object.entries(s.tasks)) {
-        if (t.status === 'error') {
-          next[id] = {
-            ...t,
-            status: 'queued',
-            error: undefined,
-            interruptReason: undefined,
-            attempts: 0,
-            retrying: false,
-            ...(t.kind === 'download' ? { progress: 0, bytesDone: 0 } : {}),
-          };
-          ids.push(id);
-        } else {
+        if (t.status !== 'error') {
           next[id] = t;
+          continue;
         }
+        errorCount += 1;
+        // 无本地文件（刷新后还原）：不能静默排队（会瞬间再失败，表现为"点了没反应"），
+        // 保持失败态并提示重选文件 —— 由 UI 先弹文件选择框，选回后再重试
+        if (t.kind !== 'download' && !t.file) {
+          next[id] = { ...t, needsFile: true, error: NEEDS_FILE_MSG, retrying: false, interruptReason: undefined };
+          continue;
+        }
+        next[id] = {
+          ...t,
+          status: 'queued',
+          error: undefined,
+          interruptReason: undefined,
+          attempts: 0,
+          retrying: false,
+          ...(t.kind === 'download' ? { progress: 0, bytesDone: 0 } : {}),
+        };
+        ids.push(id);
       }
-      if (ids.length === 0) return {};
-      return { tasks: next, ...(s.pauseReason === 'user' ? { paused: false, pauseReason: undefined } : {}) };
+      if (errorCount === 0) return {};
+      // 用户显式重试 = 继续传：解除暂停（登录过期需先重新登录）
+      return { tasks: next, ...(s.paused && s.pauseReason !== 'token_expired' ? { paused: false, pauseReason: undefined } : {}) };
     });
     if (ids.length === 0) return;
     // 上传与下载分开调度（下载有自己的并发上限，且不进入上传 FIFO）
     const uploadIds = ids.filter((id) => get().tasks[id]?.kind !== 'download');
     const downloadIds = ids.filter((id) => get().tasks[id]?.kind === 'download');
-    if (uploadIds.length > 0) {
+    if (uploadIds.length > 0 && !get().paused) {
       queuedIds.push(...uploadIds);
       updateLimit(get().tasks);
       for (let i = 0; i < MAX_PARALLEL_SMALL; i++) void pump();
     }
     if (downloadIds.length > 0) pumpDownloads();
+  },
+
+  // 需要重新选择本地文件的失败任务（v1.1.13）
+  needsFileIds: () =>
+    Object.values(get().tasks)
+      .filter((t) => t.kind !== 'download' && !t.file && t.status !== 'completed' && t.status !== 'dedup')
+      .map((t) => t.id),
+
+  // 补上本地文件引用并立即重新入队（v1.1.13）：断点续传（IndexedDB 记录按 目录+文件名+大小 索引）
+  attachFile: (id, file) => {
+    const t = get().tasks[id];
+    if (!t) return { ok: false, reason: '任务不存在（可能已被移除）' };
+    if (t.kind === 'download') return { ok: false, reason: '下载任务不需要选择文件' };
+    if (file.name !== t.fileName || file.size !== t.size) {
+      return {
+        ok: false,
+        reason: `文件不匹配：该任务需要「${t.fileName}」（${fmtSize(t.size)}），而选择的是「${file.name}」（${fmtSize(file.size)}）。续传记录按文件名+大小索引，请选择刷新前那一个文件。`,
+      };
+    }
+    if (!file.size) return { ok: false, reason: '该文件为空（0 字节），无法作为续传来源' };
+    const warning =
+      t.lastModified && file.lastModified && Math.abs(file.lastModified - t.lastModified) > 1000
+        ? '所选文件的修改时间与刷新前不一致：如果内容已改动，请在续传前点「移除」后重新上传，避免出现内容不一致。'
+        : undefined;
+    set((s) => {
+      const cur = s.tasks[id];
+      if (!cur) return {};
+      return {
+        tasks: {
+          ...s.tasks,
+          [id]: {
+            ...cur,
+            file,
+            lastModified: file.lastModified,
+            needsFile: false,
+            status: 'queued',
+            error: undefined,
+            interruptReason: undefined,
+            attempts: 0,
+            retrying: false,
+          },
+        },
+        ...(s.paused && s.pauseReason !== 'token_expired' ? { paused: false, pauseReason: undefined } : {}),
+      };
+    });
+    if (get().paused) return { ok: true, warning }; // 登录过期：等重新登录后自动继续
+    requeue(id);
+    updateLimit(get().tasks);
+    for (let i = 0; i < MAX_PARALLEL_SMALL; i++) void pump();
+    return { ok: true, warning };
   },
 
   // 暂停单个任务：queued→直接暂停；在传→中断请求（uploader 保留断点）
@@ -863,6 +986,8 @@ interface SlimTask {
   progress: number;
   bytesDone: number;
   error?: string;
+  /** 本地文件修改时间（v1.1.13：重选文件时校验是否为同一个文件） */
+  lastModified?: number;
 }
 const INTERRUPTED = new Set<UploadTaskStatus>(['queued', 'hashing', 'uploading', 'downloading', 'paused', 'auth-failed']);
 
@@ -882,6 +1007,7 @@ function persistSnapshot(): void {
       progress: t.progress,
       bytesDone: t.bytesDone,
       error: t.error,
+      lastModified: t.lastModified,
     }));
     localStorage.setItem(PERSIST_KEY, JSON.stringify(slim));
   } catch {
@@ -939,10 +1065,13 @@ export function hydrateTaskList(): void {
     const kind: TaskKind = s.kind === 'download' ? 'download' : 'upload';
     const interrupted = INTERRUPTED.has(s.status);
     const status: UploadTaskStatus = interrupted ? 'error' : s.status;
+    // 上传任务被打断 → 本地 File 引用必然丢失（无法持久化），标记 needsFile：
+    // UI 会把「重试」换成「重新选择文件」，点选回同一个文件即可断点续传
+    const needsFile = interrupted && kind !== 'download';
     const error = interrupted
       ? kind === 'download'
         ? '页面刷新导致中断，可点击「重新下载」'
-        : '页面刷新导致中断：请重新选择该文件上传（≤8MB 的小文件会自动续传）'
+        : NEEDS_FILE_MSG
       : s.error;
     const task: UploadTask = {
       id: s.id,
@@ -953,6 +1082,8 @@ export function hydrateTaskList(): void {
       file: undefined as unknown as File,
       fileId: s.fileId,
       isDir: s.isDir,
+      needsFile,
+      lastModified: s.lastModified,
       status,
       progress: interrupted ? 0 : s.progress ?? 0,
       bytesDone: interrupted ? 0 : s.bytesDone ?? 0,
@@ -966,6 +1097,30 @@ export function hydrateTaskList(): void {
   }
   if (Object.keys(restored).length === 0) return;
   useUploadStore.setState((s) => ({ tasks: restored, visible: true, ...(s.panelMode === 'dock' ? {} : { panelCollapsed: false }) }));
+  // 小文件（≤8MB）的 File 引用被存进了 IndexedDB 续传记录 → 直接自动续传同一个任务（不新建重复条目）
+  void autoResumeSmallFromRecords(restored);
+}
+
+/**
+ * 刷新后用 IndexedDB 里保存的 File 引用自动续传小文件（v1.1.13）。
+ * 背景：小文件（≤8MB）上传时，续传记录里连 File 一起存了（resume-store.FILE_PERSIST_LIMIT），
+ * 所以不必让用户重选；大文件浏览器无法持久化 File，只能由用户重新选择（needsFile）。
+ */
+async function autoResumeSmallFromRecords(restored: Record<string, UploadTask>): Promise<void> {
+  const targets = Object.values(restored).filter((t) => t.needsFile && t.size > 0 && t.size <= FILE_PERSIST_LIMIT);
+  if (targets.length === 0) return;
+  for (const t of targets) {
+    try {
+      const rec = await loadResumeRecord(resumeKey(t.dirId, t.fileName, t.size));
+      const f = rec?.file;
+      if (!f) continue; // 没有持久化的 File → 保持 needsFile，等用户重选
+      const cur = useUploadStore.getState().tasks[t.id];
+      if (!cur || !cur.needsFile) continue; // 用户已经手动处理过
+      useUploadStore.getState().attachFile(t.id, f);
+    } catch {
+      /* IndexedDB 不可用：保持 needsFile（用户点「重新选择文件」） */
+    }
+  }
 }
 
 // 订阅 store：任务变化时节流持久化（含进度更新）

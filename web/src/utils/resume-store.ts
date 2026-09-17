@@ -29,21 +29,61 @@ export interface ResumeRecord {
 
 const DB_NAME = 'nd-resume-db';
 const STORE = 'sessions';
+// 初始建库版本：仅"库不存在、由浏览器首次创建"时生效（不带版本号 open 时浏览器建 v1）。
+// 之后一律**不带版本号**打开，避免库里版本被升过（自愈/其它工具）后固定版本号导致 VersionError。
 const DB_VERSION = 1;
 // localStorage 降级 key（IndexedDB 不可用时使用；File 引用无法序列化 → 只存进度）
 const LS_KEY = 'nd_resume_sessions_v2';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let idbUnavailable = false; // 标记 IndexedDB 不可用（隐私模式等），后续直接走 localStorage
+let currentDbVersion = 0; // 当前打开的库版本（供调试钩子）
+let unavailableReason: unknown = null;
+
+/** 标记 IndexedDB 不可用（只告警一次，便于现场排查"刷新后为什么不续传"） */
+function markUnavailable(reason: unknown): void {
+  if (idbUnavailable) return;
+  idbUnavailable = true;
+  unavailableReason = reason;
+  console.warn('[resume] IndexedDB 不可用，续传记录降级 localStorage（File 引用会丢失，刷新后需重选文件）', reason);
+}
 
 function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
+  const p = openCurrent(0);
+  dbPromise = p;
+  void p.catch(() => {
+    if (dbPromise === p) dbPromise = null; // 失败允许下次重试（降级 localStorage 由调用方处理）
+  });
+  return p;
+}
+
+/**
+ * 打开数据库，并确保对象存储存在。
+ *
+ * v1.1.13 加固（两处真实缺陷）：
+ *  1) **不要固定版本号打开**。历史实现一律 `indexedDB.open(DB_NAME, 1)`，一旦库被升到 v2
+ *     （例如下面的自愈、或其它代码/工具升级过），后续每次打开都会 `VersionError`
+ *     → 整个续传能力静默降级到 localStorage（File 引用丢失，刷新后无法自动续传）。
+ *     现在改为不带版本号打开（沿用现有版本；库不存在时由浏览器建 v1 并触发 upgrade）。
+ *  2) 若同名库存在但**缺少对象存储**（被其它工具用同名库创建过），光靠 `onupgradeneeded`
+ *     永远补不上——事务一直 NotFoundError。此时升一个版本号重开，强制触发 upgrade 重建存储。
+ */
+function openCurrent(attempt: number): Promise<IDBDatabase> {
+  return openRequest(undefined, attempt);
+}
+
+function openWithVersion(version: number, attempt: number): Promise<IDBDatabase> {
+  return openRequest(version, attempt);
+}
+
+function openRequest(version: number | undefined, attempt: number): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
     let req: IDBOpenDBRequest;
     try {
-      req = indexedDB.open(DB_NAME, DB_VERSION);
+      req = version === undefined ? indexedDB.open(DB_NAME) : indexedDB.open(DB_NAME, version);
     } catch (e) {
-      idbUnavailable = true;
+      markUnavailable('indexedDB.open 抛异常（隐私模式/权限拒绝）');
       reject(e);
       return;
     }
@@ -54,15 +94,34 @@ function openDb(): Promise<IDBDatabase> {
         store.createIndex('updatedAt', 'updatedAt');
       }
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const db = req.result;
+      if (db.objectStoreNames.contains(STORE)) {
+        currentDbVersion = db.version;
+        resolve(db);
+        return;
+      }
+      // 库存在但存储缺失：自愈（升版本重建）
+      const nextVersion = db.version + 1;
+      db.close();
+      if (attempt >= 3) {
+        markUnavailable('续传库缺少 sessions 存储且升版本重建失败');
+        reject(new Error('IndexedDB 续传库初始化失败：对象存储缺失'));
+        return;
+      }
+      console.info(`[resume] 续传库缺少 sessions 存储，已升版本重建：v${db.version} → v${nextVersion}`);
+      openWithVersion(nextVersion, attempt + 1).then(resolve, reject);
+    };
     req.onerror = () => {
       // 隐私模式/权限拒绝 → 降级 localStorage
-      idbUnavailable = true;
+      markUnavailable('打开续传库失败');
       dbPromise = null;
       reject(req.error);
     };
+    req.onblocked = () => {
+      // 其它标签页持有旧连接：其关闭后本请求会继续，无需处理（超时由调用方降级兜底）
+    };
   });
-  return dbPromise;
 }
 
 function tx<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
@@ -149,7 +208,7 @@ async function flushBatch(batch: Map<string, ResumeRecord>): Promise<void> {
     });
   } catch {
     // IndexedDB 失败 → 降级 localStorage（File 引用无法序列化，丢弃）
-    idbUnavailable = true;
+    markUnavailable('写入续传记录失败（降级 localStorage）');
     for (const rec of batch.values()) {
       const { file: _file, ...rest } = rec;
       lsPut(rest);
@@ -164,7 +223,7 @@ export async function loadResumeRecords(): Promise<ResumeRecord[]> {
       const all = await tx<ResumeRecord[]>('readonly', (s) => s.getAll());
       return all.filter((r) => r.updatedAt >= Date.now() - 7 * 86400_000);
     } catch {
-      idbUnavailable = true;
+      markUnavailable('读取续传记录列表失败');
     }
   }
   // localStorage 降级
@@ -182,7 +241,7 @@ export async function loadResumeRecord(key: string): Promise<ResumeRecord | null
       const rec = await tx<ResumeRecord | undefined>('readonly', (s) => s.get(key));
       if (rec) return rec;
     } catch {
-      idbUnavailable = true;
+      markUnavailable('读取单条续传记录失败');
     }
   }
   const ls = lsGet(key);
@@ -212,7 +271,7 @@ export async function removeResumeRecord(key: string): Promise<void> {
     try {
       await tx('readwrite', (s) => s.delete(key));
     } catch {
-      idbUnavailable = true;
+      markUnavailable('删除续传记录失败');
     }
   }
   lsDel(key);
@@ -274,3 +333,16 @@ export async function clearAllResume(): Promise<void> {
 
 /** FileItem 类型再导出（供 uploader 使用） */
 export type { FileItem };
+
+// 测试/调试钩子（与 window.__uploadStore 一致）：现场排查「刷新后为什么不续传」时直接看这里
+if (typeof window !== 'undefined') {
+  (window as unknown as { __resumeDebug?: unknown }).__resumeDebug = () => ({
+    idbUnavailable,
+    unavailableReason: unavailableReason ? String(unavailableReason) : null,
+    dbVersion: currentDbVersion,
+    dbName: DB_NAME,
+    store: STORE,
+    initialVersion: DB_VERSION,
+    pendingWrites: pendingWrites.size,
+  });
+}

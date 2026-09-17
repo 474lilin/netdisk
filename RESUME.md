@@ -1,26 +1,62 @@
 # 开机续接指南（RESUME）
 
-> 更新：2026-09-16（v1.1.12 网盘功能全面体检：33 项全通过，并修复「任务面板盖住行内下拉菜单」）。
+> 更新：2026-09-17（v1.1.13 修复「刷新后失败任务点重试没反应」；
+> **并排查出真正的上传失败根因：存储盘 N: 写满，MinIO 报 XMinioStorageFull**）。
 > 下次继续开发/测试前先读本文。
 
-## 1. 当前状态快照（2026-09-16 核对）
+## 0. ⚠️ 头号运维红线：存储盘写满 = 所有上传失败（2026-09-17 实测）
+
+- MinIO 数据目录 = 宿主机 **`N:\minio-data-single`**（override 里 bind 到容器 `/data1`，
+  启动参数 `minio server /data1`）。**N: 盘 200GB 写满（只剩 6MB）时**：
+  - 服务端日志近 7 天 **2252 次** `XMinioStorageFull: Storage backend has reached its minimum
+    free drive threshold`，全部发生在 `initUpload`（`POST /api/files/upload/init`）
+  - 现象就是用户看到的「上传任务失败」——**和前端、网络都无关，是磁盘满了**
+- **版本控制是开启的**（`mc version info nd/netdisk-data` → enabled）：
+  「删除文件」只是打**删除标记**，**空间不释放**；历史版本会一直占盘。
+  实测清理前：`137 GiB Used / 31634 Objects / 52687 Versions / 18322 Delete Markers`，
+  而数据库存活文件只有 2587 个 —— 空间几乎全被历史版本与删除标记吃掉。
+- **日常排查三连**（发现上传莫名失败先跑这个）：
+  ```powershell
+  [System.IO.DriveInfo]::new('N').AvailableFreeSpace/1GB          # 剩余空间（<10GB 就会拒写）
+  docker exec netdisk-minio sh -c "df -h /data1"                   # 容器内视角
+  docker logs netdisk-server --since 24h 2>&1 | Select-String XMinioStorageFull
+  ```
+- **回收空间（安全顺序）**：
+  ```powershell
+  $u=(Select-String -Path .env -Pattern '^MINIO_ROOT_USER=').Line -replace '^MINIO_ROOT_USER=',''
+  $p=(Select-String -Path .env -Pattern '^MINIO_ROOT_PASSWORD=').Line -replace '^MINIO_ROOT_PASSWORD=',''
+  .\mc.exe alias set nd http://127.0.0.1:9000 $u $p --api S3v4
+  .\mc.exe rm --incomplete --recursive --force nd/netdisk-data            # 1) 未完成分片上传残留
+  .\mc.exe rm --recursive --force --versions --non-current nd/netdisk-data # 2) 非当前版本+删除标记
+  .\mc.exe admin info nd                                                   # 3) 复核 Used/Objects/Versions
+  ```
+  > 注意：清理前先 `pg_dump`（见 `docs/04-备份与恢复.md`），并确认**当前可见文件不受影响**
+  > （`--non-current` 不动当前版本）；代价是失去「版本回滚/误删恢复」能力。
+  > 另：`N:\minio-data-backup-20260826`（14.5GB 陈旧原始副本）已于 2026-09-17 移到 `E:\`，
+  > 未删除；`.env`/override 未改动。
+
+## 1. 当前状态快照（2026-09-17 核对）
 
 - 5 容器：`netdisk-server` / `netdisk-web` / `netdisk-minio` / `netdisk-postgres` / `netdisk-redis`（全部 healthy）
 - **MinIO 拓扑：单盘**（默认命名卷 `minio-data`；本地 override 单盘 bind 到 `N:\minio-data-single`；
   旧 4 盘纠删码数据在 `N:\minio-data\data1..4` 已不再读取，确认无需后可删除释放空间）
 - **Redis 热点缓存**：目录列表（`dir:{orgId}:{userId}:{dirId}`，TTL 30s）+ 分享元信息（`share:{token}`，TTL 15s/到期精确）；写操作主动失效；权限实时校验不缓存
-- **PostgreSQL 实际数据**：`files=807`（活跃）、`directories=1449`、回收站 152 项、
-  `dedup_pool=485`、`users=2`（admin 管理员 + demo 演示账号）
+- **PostgreSQL 实际数据**（2026-09-17 备份前实测）：`files=2587`（活跃，67GB）、`directories=588`、
+  回收站 152 项（11GB）、`dedup_pool=1496`（58GB）、`users=2`（admin 管理员 + demo 演示账号）
   - 注：2026-08-27 曾按用户确认清空全部数据（含 21k 测试目录），此后为新一轮真实上传数据
-- **部署版本**：web/server 均为 **v1.1.12**（镜像构建 2026-09-14，代码与镜像一致已核对）
+- **MinIO 侧对象**：`31634 Objects / 52687 Versions / 18322 Delete Markers`（清理前）
+- **部署版本**：web/server 均为 **v1.1.13**（镜像构建 2026-09-17，代码与镜像一致已核对）
   - v1.1.11：修复「上传目标目录已删除」404 风暴（立即失败 + 整批清理 + 按目录暂停）
   - v1.1.12：全功能体检 33 项通过；修复任务面板 z-index 遮挡行内下拉菜单
+  - v1.1.13：刷新后失败任务可「重新选择文件」断点续传；retryTask/批量重试解除队列暂停；
+    小文件自动续传不再产生重复任务（详见 CHANGELOG）
 - Docker VM：6GB / 4 核（`.wslconfig`）；镜像加速 `docker.m.daocloud.io`
 - **代码仓库：已初始化 git 并推送 GitHub** —— https://github.com/474lilin/netdisk（Public）
   - 本地目录 `N:\奇思妙想\minio-netdisk`；远端 `origin`
   - `.gitignore` 已排除 `.env`/备份/测试残留/本机 override（.env 仅存本地，不入库）
   - 推送命令：`git add -A && git commit -m "..." && git push`
-- 备份方式：`docs/04-备份与恢复.md`（pg_dump + mc mirror）；关机前备份在 `backups/`（本地，不入库）
+- 备份方式：`docs/04-备份与恢复.md`（pg_dump + mc mirror）；
+  2026-09-17 清理前备份：`E:\netdisk-backups\nd-pre-cleanup-20260917-1305.dump`（7.1MB）
 
 ## 2. 开机重启步骤
 
@@ -54,6 +90,13 @@ node deploy/scripts/bench-io.mjs 512
 node deploy/scripts/bench-b3.mjs
 # 浏览器 e2e
 cd e2e && node browser-e2e.mjs
+# 刷新后重试修复专项（v1.1.13：2×40MB + 6MB 上传中刷新 → 重选文件断点续传，约 2-4 分钟）
+cd e2e && node _ui-retry-after-refresh.mjs
+# 断点记录写入核查（IndexedDB；含"污染库自愈"场景）
+cd e2e && node _probe-resume-idb.mjs
+# 存储完整性核验（对照数据库核对每个存活文件的对象可读性 + 抽样 B3SEG 哈希，约 5-8 分钟）
+#   前置：需先生成清单（见 docs/04-备份与恢复.md 或 CHANGELOG v1.1.13 说明）
+cd e2e && node _verify-storage-integrity.mjs
 # 回收站/文件页批量操作分批回归（造 105 目录→全选删除→全选彻底删除→清空，约 2 分钟）
 cd e2e && node _trash-batch-full.mjs
 # 体验断言回归（表单校验/按钮态/权限/协议弹窗/移动端，约 1 分钟）
