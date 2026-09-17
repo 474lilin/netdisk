@@ -1,239 +1,495 @@
-﻿# 寮€鏈虹画鎺ユ寚鍗楋紙RESUME锛?
-> 鏇存柊锛?026-09-17锛坴1.1.13 淇銆屽埛鏂板悗澶辫触浠诲姟鐐归噸璇曟病鍙嶅簲銆嶏紱
-> **骞舵帓鏌ュ嚭鐪熸鐨勪笂浼犲け璐ユ牴鍥狅細瀛樺偍鐩?N: 鍐欐弧锛孧inIO 鎶?XMinioStorageFull**锛夈€?> 涓嬫缁х画寮€鍙?娴嬭瘯鍓嶅厛璇绘湰鏂囥€?
-## 0. 鈿狅笍 澶村彿杩愮淮绾㈢嚎锛氬瓨鍌ㄧ洏鍐欐弧 = 鎵€鏈変笂浼犲け璐ワ紙2026-09-17 瀹炴祴锛?
-- MinIO 鏁版嵁鐩綍 = 瀹夸富鏈?**`N:\minio-data-single`**锛坥verride 閲?bind 鍒板鍣?`/data1`锛?  鍚姩鍙傛暟 `minio server /data1`锛夈€?*N: 鐩?200GB 鍐欐弧锛堝彧鍓?6MB锛夋椂**锛?  - 鏈嶅姟绔棩蹇楄繎 7 澶?**2252 娆?* `XMinioStorageFull: Storage backend has reached its minimum
-    free drive threshold`锛屽叏閮ㄥ彂鐢熷湪 `initUpload`锛坄POST /api/files/upload/init`锛?  - 鐜拌薄灏辨槸鐢ㄦ埛鐪嬪埌鐨勩€屼笂浼犱换鍔″け璐ャ€嶁€斺€?*鍜屽墠绔€佺綉缁滈兘鏃犲叧锛屾槸纾佺洏婊′簡**
-- **鐗堟湰鎺у埗鏄紑鍚殑**锛坄mc version info nd/netdisk-data` 鈫?enabled锛夛細
-  銆屽垹闄ゆ枃浠躲€嶅彧鏄墦**鍒犻櫎鏍囪**锛?*绌洪棿涓嶉噴鏀?*锛涘巻鍙茬増鏈細涓€鐩村崰鐩樸€?  瀹炴祴娓呯悊鍓嶏細`137 GiB Used / 31634 Objects / 52687 Versions / 18322 Delete Markers`锛?  鑰屾暟鎹簱瀛樻椿鏂囦欢鍙湁 2587 涓?鈥斺€?绌洪棿鍑犱箮鍏ㄨ鍘嗗彶鐗堟湰涓庡垹闄ゆ爣璁板悆鎺夈€?- **鏃ュ父鎺掓煡涓夎繛**锛堝彂鐜颁笂浼犺帿鍚嶅け璐ュ厛璺戣繖涓級锛?  ```powershell
-  [System.IO.DriveInfo]::new('N').AvailableFreeSpace/1GB          # 鍓╀綑绌洪棿锛?10GB 灏变細鎷掑啓锛?  docker exec netdisk-minio sh -c "df -h /data1"                   # 瀹瑰櫒鍐呰瑙?  docker logs netdisk-server --since 24h 2>&1 | Select-String XMinioStorageFull
+# 开机续接指南（RESUME）
+
+> 更新：2026-09-17（v1.1.13 修复「刷新后失败任务点重试没反应」；
+> **并排查出真正的上传失败根因：存储盘 N: 写满，MinIO 报 XMinioStorageFull**）。
+> 下次继续开发/测试前先读本文。
+
+## 0. ⚠️ 头号运维红线：存储盘写满 = 所有上传失败（2026-09-17 实测）
+
+- MinIO 数据目录 = 宿主机 **`N:\minio-data-single`**（override 里 bind 到容器 `/data1`，
+  启动参数 `minio server /data1`）。**N: 盘 200GB 写满（只剩 6MB）时**：
+  - 服务端日志近 7 天 **2252 次** `XMinioStorageFull: Storage backend has reached its minimum
+    free drive threshold`，全部发生在 `initUpload`（`POST /api/files/upload/init`）
+  - 现象就是用户看到的「上传任务失败」——**和前端、网络都无关，是磁盘满了**
+- **版本控制是开启的**（`mc version info nd/netdisk-data` → enabled）：
+  「删除文件」只是打**删除标记**，**空间不释放**；历史版本会一直占盘。
+  实测清理前：`137 GiB Used / 31634 Objects / 52687 Versions / 18322 Delete Markers`，
+  而数据库存活文件只有 2587 个 —— 空间几乎全被历史版本与删除标记吃掉。
+- **日常排查三连**（发现上传莫名失败先跑这个）：
+  ```powershell
+  [System.IO.DriveInfo]::new('N').AvailableFreeSpace/1GB          # 剩余空间（<10GB 就会拒写）
+  docker exec netdisk-minio sh -c "df -h /data1"                   # 容器内视角
+  docker logs netdisk-server --since 24h 2>&1 | Select-String XMinioStorageFull
   ```
-- **鍥炴敹绌洪棿锛堝畨鍏ㄩ『搴忥級**锛?  ```powershell
+- **回收空间（安全顺序）**：
+  ```powershell
   $u=(Select-String -Path .env -Pattern '^MINIO_ROOT_USER=').Line -replace '^MINIO_ROOT_USER=',''
   $p=(Select-String -Path .env -Pattern '^MINIO_ROOT_PASSWORD=').Line -replace '^MINIO_ROOT_PASSWORD=',''
   .\mc.exe alias set nd http://127.0.0.1:9000 $u $p --api S3v4
-  .\mc.exe rm --incomplete --recursive --force nd/netdisk-data            # 1) 鏈畬鎴愬垎鐗囦笂浼犳畫鐣?  .\mc.exe rm --recursive --force --versions --non-current nd/netdisk-data # 2) 闈炲綋鍓嶇増鏈?鍒犻櫎鏍囪
-  .\mc.exe admin info nd                                                   # 3) 澶嶆牳 Used/Objects/Versions
+  .\mc.exe rm --incomplete --recursive --force nd/netdisk-data            # 1) 未完成分片上传残留
+  .\mc.exe rm --recursive --force --versions --non-current nd/netdisk-data # 2) 非当前版本+删除标记
+  .\mc.exe admin info nd                                                   # 3) 复核 Used/Objects/Versions
   ```
-  > 娉ㄦ剰锛氭竻鐞嗗墠鍏?`pg_dump`锛堣 `docs/04-澶囦唤涓庢仮澶?md`锛夛紝骞剁‘璁?*褰撳墠鍙鏂囦欢涓嶅彈褰卞搷**
-  > 锛坄--non-current` 涓嶅姩褰撳墠鐗堟湰锛夛紱浠ｄ环鏄け鍘汇€岀増鏈洖婊?璇垹鎭㈠銆嶈兘鍔涖€?  > 鍙︼細`N:\minio-data-backup-20260826`锛?4.5GB 闄堟棫鍘熷鍓湰锛夊凡浜?2026-09-17 绉诲埌 `E:\`锛?  > 鏈垹闄わ紱`.env`/override 鏈敼鍔ㄣ€?
-## 0. 鈿狅笍 浜嬫晠璁板綍涓庢晳鎻达紙2026-09-17锛夛細鏁存《璇垹锛屾鍦ㄥ弽鍒犻櫎鏁戞彺
+  > 注意：清理前先 `pg_dump`（见 `docs/04-备份与恢复.md`），并确认**当前可见文件不受影响**
+  > （`--non-current` 不动当前版本）；代价是失去「版本回滚/误删恢复」能力。
+  > 另：`N:\minio-data-backup-20260826`（14.5GB 陈旧原始副本）已于 2026-09-17 移到 `E:\`，
+  > 未删除；`.env`/override 未改动。
 
-### 鍙戠敓浜嗕粈涔?鎵ц銆屾竻鐞嗗鍎垮璞°€嶆椂鐢ㄤ簡锛?`mc rm --recursive --force --versions --stdin nd/netdisk-data < 娓呭崟鏂囦欢>`
-**鍦ㄥ惎鐢ㄧ増鏈帶鍒剁殑妗朵笂锛岃鍛戒护浼氬拷鐣?stdin 娓呭崟锛岀洿鎺ラ€掑綊鍒犻櫎璺緞鍙傛暟锛堟暣涓《锛変笅鐨勪竴鍒?*銆?瀹炴祴澶嶇幇锛氫复鏃舵《閲屽彧鍒?2 涓?key锛屾墽琛屽悗 5 涓璞″叏琚垹锛涙崲鎴愰潪鐗堟湰鍖栨《鍒欏彧鍒犳竻鍗曞唴鐨?2 涓€?锛堟鍓嶅彧鐢?鍗曚釜 key"璇曞垹杩囷細閭ｆ椂璺緞鍙傛暟鎭板ソ灏辨槸閭ｄ釜 key锛屾墍浠ョ湅璧锋潵姝ｇ‘ 鈥斺€?閿欒鐨勬帹骞裤€傦級
-鍚庢灉锛歚netdisk-data` 鍏ㄩ儴瀵硅薄琚墿鐞嗗垹闄わ紙2587 涓湪绾挎枃浠?67GB + 鍥炴敹绔?11GB + 鍘婚噸姹犲璞★級銆?
-### 鐜扮姸
-- **鏁版嵁搴撳畬濂?*锛氭枃浠?鐩綍鏍戙€佹枃浠跺悕銆佸ぇ灏忋€?*B3SEG 鍝堝笇**銆乣object_key`銆乷wner銆佹椂闂村叏鍦ㄣ€?- **宸插仛鐨?鎭㈠姝ｅ父"澶勭疆锛?026-09-17锛?*锛氭妸 2587 鏉?鍐呭宸蹭涪澶?鐨勬枃浠惰绉诲叆**鍥炴敹绔?*
-  锛坄is_deleted=true`锛宍object_key` 鍘熸牱淇濈暀锛夆啋 涓诲垪琛ㄤ笉鍐嶆湁鎵撲笉寮€鐨勭┖澹虫潯鐩紱**590 涓洰褰曚繚鐣?*锛?  鍘熺洰褰曠粨鏋勮繕鍦紝渚夸簬鎸夊師浣嶇疆閲嶄紶銆傚簱鍐呭彟瀛樹簡瀹屾暣澶囦唤琛細
-  `lost_20260917_files`锛?739 琛岋級銆乣lost_20260917_file_versions`锛?776 琛岋級銆乣lost_20260917_dedup_pool`锛?444 琛岋級銆?- **鍙敤鎬у疄娴嬶紙2026-09-17 鍏ㄩ儴閫氳繃锛?*锛?  - N: 200GB / 宸茬敤 46.9GB / **绌洪棽 153.1GB**
-  - MinIO 鐪熷疄瀛樺偍璺緞锛堝鍣?`/data1` 鈫?N: bind锛夊啓鍏?2MB 鈫?stat 鈫?璇诲洖锛?*SHA-256 瀹屽叏涓€鑷?*
-  - 绔埌绔細涓婁紶 鈫?鍚屽悕鍐嶄紶鍛戒腑绉掍紶 鈫?鍒犻櫎瀵硅薄鍚庡悓鍚嶅啀浼狅紙瀹堝崼鐢熸晥璧扮湡瀹炰笂浼狅級鈫?涓嬭浇鍐呭涓€鑷?    锛坄node e2e/_test-dedup-guard.mjs`锛屽叏閮ㄩ€氳繃锛?  - 涓诲垪琛?HRTTP 200 涓旀棤绌哄３鏉＄洰锛涘洖鏀剁珯 2739 鏉★紱鍒楄〃/鍥炴敹绔欐帴鍙ｆ甯?- **鏁戞彺鎴愬姛鍚庣殑鎭㈠鍔ㄤ綔**锛氬璞℃斁鍥炲師 key 鍚庯紝杩涖€屽洖鏀剁珯銆嶅叏閫?鈫?**鎭㈠**锛岃繖浜涙潯鐩嵆鍙噸鏂板彲瑙?鍙笅杞?  锛坄object_key` 鏈彉锛屾棤闇€鏀瑰簱锛夈€傝嫢鏁戞彺鍙崬鍥炰竴閮ㄥ垎锛屽垯鍙仮澶嶉偅閮ㄥ垎瀵瑰簲鐨勬潯鐩嵆鍙€?- MinIO锛歚/data1/netdisk-data` 浠呭墿绾?700MB 鍏冩暟鎹紝瀵硅薄涓嶅瓨鍦ㄣ€?- `vssadmin` 鏌?N: **鏃犲嵎褰卞壇鏈?*锛沗backups/` 鍙湁 pg_dump锛堟棤瀵硅薄锛夈€?- `E:\minio-data-backup-20260826`锛?/26 閭ｄ唤锛夋槸**8/27 宸茬‘璁ゅ垹闄ょ殑鑰佹暟鎹?*锛屾娊鏍?0/20 鍛戒腑褰撳墠鏂囦欢锛屾晳涓嶄簡杩欐銆?- 鍏抽敭鍓嶆彁锛氫笅杞芥帴鍙?`presignGet(object_key)` **涓嶉攣 version_id**锛堟寜 key 鍙栧綋鍓嶇増鏈級
-  鈫?**鍙鎶婂璞″唴瀹规斁鍥炲師 key锛岀綉鐩樻棤闇€鏀瑰簱鍗冲彲鎭㈠**锛坄version_id` 鍙奖鍝嶅巻鍙茬増鏈洖婊氾級銆?
-### 鏁戞彺姝ラ锛堝凡澶囧ソ鑴氭湰锛岃剼鏈凡鑷祴閫氳繃锛?```powershell
-# 1) 绔嬪埢姝㈡崯锛氫笉瑕佸啀寰€ N: 鍐欎换浣曚笢瑗匡紙鍒笂浼犮€佸埆鎷锋枃浠惰繘鍘伙級锛孌ocker 鍙繚鎸佽繍琛?# 2) 鐢ㄥ弽鍒犻櫎宸ュ叿鎶婃暣妫电洰褰曟寜"淇濈暀璺緞"鎭㈠鍒版殏瀛樼洰褰曪紙**缁濅笉鑳芥仮澶嶅埌 N:**锛?#    鐩爣璺緞锛歂:\minio-data-single\netdisk-data     鎺ㄨ崘宸ュ叿锛欴iskGenius / R-Studio / Recuva
-#    绾鍚嶆仮澶嶏紙PhotoRec 鏃犺矾寰勶級涔熻鈥斺€旇剼鏈細鎸夊唴瀹瑰搱甯岃嚜鍔ㄥ尮閰?#    鏆傚瓨鐩綍寤鸿锛欵:\recover-stage 锛圗: 闇€瀹圭撼 ~73GB锛?# 3) 鍒嗘瀽锛堝彧璇伙紝涓嶅姩鏁版嵁锛?$env:STAGE='E:\recover-stage'; node e2e/_rescue-rebuild.mjs analyze
-# 4) 鍥炰紶锛堟牎楠岄€氳繃鐨勫璞℃墠涓婁紶鍒板師 key锛歮c cp 鍒?nd/netdisk-data/<鍘?key>锛?$env:STAGE='E:\recover-stage'; node e2e/_rescue-rebuild.mjs restore
-# 5) 澶嶆牳
+## 0. ⚠️ 事故记录与救援（2026-09-17）：整桶误删，正在反删除救援
+
+### 发生了什么
+执行「清理孤儿对象」时用了：
+`mc rm --recursive --force --versions --stdin nd/netdisk-data < 清单文件>`
+**在启用版本控制的桶上，该命令会忽略 stdin 清单，直接递归删除路径参数（整个桶）下的一切**。
+实测复现：临时桶里只列 2 个 key，执行后 5 个对象全被删；换成非版本化桶则只删清单内的 2 个。
+（此前只用"单个 key"试删过：那时路径参数恰好就是那个 key，所以看起来正确 —— 错误的推广。）
+后果：`netdisk-data` 全部对象被物理删除（2587 个在线文件 67GB + 回收站 11GB + 去重池对象）。
+
+### 现状
+- **数据库完好**：文件/目录树、文件名、大小、**B3SEG 哈希**、`object_key`、owner、时间全在。
+- **已做的「恢复正常」处置（2026-09-17）**：2587 条「内容已丢失」的文件行移入**回收站**
+  （`is_deleted=true`，`object_key` 原样保留）→ 主列表不再有打不开的空壳条目；**590 个目录保留**，
+  原目录结构还在，便于按原位置重传。库内另存完整备份表：
+  `lost_20260917_files`（2739 行）、`lost_20260917_file_versions`（2776 行）、`lost_20260917_dedup_pool`（1444 行）。
+- **可用性实测（2026-09-17 全部通过）**：
+  - N: 200GB / 已用 46.9GB / **空闲 153.1GB**
+  - MinIO 真实存储路径（容器 `/data1` → N: bind）写入 2MB → stat → 读回，**SHA-256 完全一致**
+  - 端到端：上传 → 同名再传命中秒传 → 删除对象后同名再传（v1.1.14 守卫生效，走真实上传）→ 下载内容一致
+    （`node e2e/_test-dedup-guard.mjs`，全部通过）
+  - 主列表 HTTP 200 且无空壳条目；回收站 2739 条；列表/回收站接口正常；缩略图 404 有 `onError` 兜底（不裂图）
+- **救援成功后的恢复动作**：对象放回原 key 后，进「回收站」全选 → **恢复**，条目即可重新可见/可下载
+  （`object_key` 未变，无需改库）。只捞回一部分就只恢复那部分条目。
+- MinIO：`/data1/netdisk-data` 仅剩约 700MB 元数据，对象不存在。
+- `vssadmin` 查 N: **无卷影副本**；`backups/` 只有 pg_dump（无对象）。
+- `E:\minio-data-backup-20260826`（8/26 那份）是**8/27 已确认删除的老数据**，抽样 0/20 命中当前文件，救不了这次。
+- 关键前提：下载接口 `presignGet(object_key)` **不锁 version_id**（按 key 取当前版本）
+  → **只要把对象内容放回原 key，网盘无需改库即可恢复**（`version_id` 只影响历史版本回滚）。
+
+### 救援步骤（已备好脚本，脚本已自测通过）
+```powershell
+# 1) 立刻止损：不要再往 N: 写任何东西（别上传、别拷文件进去），Docker 可保持运行
+# 2) 用反删除工具把整棵目录按"保留路径"恢复到暂存目录（**绝不能恢复到 N:**）
+#    目标路径：N:\minio-data-single\netdisk-data     推荐工具：DiskGenius / R-Studio / Recuva
+#    纯签名恢复（PhotoRec 无路径）也行——脚本会按内容哈希自动匹配
+#    暂存目录建议：E:\recover-stage （E: 需容纳 ~73GB）
+# 3) 分析（只读，不动数据）
+$env:STAGE='E:\recover-stage'; node e2e/_rescue-rebuild.mjs analyze
+# 4) 回传（校验通过的对象才上传到原 key：mc cp 到 nd/netdisk-data/<原 key>）
+$env:STAGE='E:\recover-stage'; node e2e/_rescue-rebuild.mjs restore
+# 5) 复核
 node e2e/_verify-storage-integrity.mjs
 ```
-- 鑴氭湰鍒ゅ畾渚濇嵁锛堥€愪竴楠岃瘉锛屼笉鐚滐級锛氭枃浠跺璞＄敤 `files.size_bytes` + `files.sha256`锛圔3SEG锛夛紱
-  鍘婚噸姹犲璞＄敤 `dedup_pool.size_bytes` + key 鏈熬鐨?sha256 娈点€?  鏀寔鍗曠洏甯冨眬鐨?`part.1鈥art.N` 鍒嗙墖鎷兼帴涓庡皬瀵硅薄"鍐呰仈鍦?xl.meta 灏鹃儴"涓ょ褰㈡€併€?- 浜х墿锛歚E:\netdisk-backups\recovery-plan.json`锛堝洖浼犺鍒掞級銆乣recovery-missing.csv`锛堟晳涓嶅洖鏉ョ殑瀵硅薄锛夈€?  `lost-manifest.csv`锛?587 涓涪澶辨枃浠剁殑瀹屾暣璺緞/澶у皬锛屼緵瀵圭収鏈湴鍘熶欢閲嶄紶锛夈€?- 鑷祴璁板綍锛歚node e2e/tmp/_rescue-selftest.mjs` 鈫?鍒嗙墖瀵硅薄涓庡唴鑱斿璞″潎鎭㈠銆侀敊璇唴瀹硅鎷掋€?  鎷兼帴缁撴灉涓庡師濮嬪瓧鑺傚畬鍏ㄤ竴鑷达紱`restore` 閫氶亾瀹炴祴 2/2 涓婁紶鎴愬姛銆?
-### 姘镐箙绂佷护锛堝啓姝诲湪杩欓噷锛岄伩鍏嶉噸鐘級
-1. **绂佹** `mc rm --recursive --force --versions --stdin <alias>/<bucket>` 杩欑"娓呭崟+閫掑綊"缁勫悎锛?   鐗堟湰鍖栨《涓嬪垹闄?*蹇呴』閫?key 鎸囧畾瀹屾暣璺緞**锛歚mc rm --recursive --force --versions nd/netdisk-data/<key>`銆?2. 浠讳綍鎵归噺鍒犻櫎鍓嶅繀椤诲厛璺?*鏁版嵁搴撳弽鏌?*锛坒iles / file_versions / upload_sessions / dedup_pool / sha256 娲剧敓
-   鍏潯閫氶亾鍏ㄩ儴 0 寮曠敤锛夛紝骞剁敤 `--dry-run` 鎴栦复鏃舵《楠岃瘉**鍛戒护褰㈠紡鏈韩**锛岃€屼笉鏄彧楠岃瘉娓呭崟鍐呭銆?3. 澶ф竻鐞嗗墠鍏堝仛 `pg_dump` + **瀵硅薄闀滃儚**锛坄mc mirror`锛夛紝涓嶈鍙浠藉厓鏁版嵁銆?
-## 1. 褰撳墠鐘舵€佸揩鐓э紙2026-09-17 鏍稿锛?
-- 5 瀹瑰櫒锛歚netdisk-server` / `netdisk-web` / `netdisk-minio` / `netdisk-postgres` / `netdisk-redis`锛堝叏閮?healthy锛?- **MinIO 鎷撴墤锛氬崟鐩?*锛堥粯璁ゅ懡鍚嶅嵎 `minio-data`锛涙湰鍦?override 鍗曠洏 bind 鍒?`N:\minio-data-single`锛?  鏃?4 鐩樼籂鍒犵爜鏁版嵁鍦?`N:\minio-data\data1..4` 宸蹭笉鍐嶈鍙栵紝纭鏃犻渶鍚庡彲鍒犻櫎閲婃斁绌洪棿锛?- **Redis 鐑偣缂撳瓨**锛氱洰褰曞垪琛紙`dir:{orgId}:{userId}:{dirId}`锛孴TL 30s锛? 鍒嗕韩鍏冧俊鎭紙`share:{token}`锛孴TL 15s/鍒版湡绮剧‘锛夛紱鍐欐搷浣滀富鍔ㄥけ鏁堬紱鏉冮檺瀹炴椂鏍￠獙涓嶇紦瀛?- **PostgreSQL 瀹為檯鏁版嵁**锛?026-09-17 澶囦唤鍓嶅疄娴嬶級锛歚files=2587`锛堟椿璺冿紝67GB锛夈€乣directories=588`銆?  鍥炴敹绔?152 椤癸紙11GB锛夈€乣dedup_pool=1496`锛?8GB锛夈€乣users=2`锛坅dmin 绠＄悊鍛?+ demo 婕旂ず璐﹀彿锛?  - 娉細2026-08-27 鏇炬寜鐢ㄦ埛纭娓呯┖鍏ㄩ儴鏁版嵁锛堝惈 21k 娴嬭瘯鐩綍锛夛紝姝ゅ悗涓烘柊涓€杞湡瀹炰笂浼犳暟鎹?- **MinIO 渚у璞?*锛歚31634 Objects / 52687 Versions / 18322 Delete Markers`锛堟竻鐞嗗墠锛?- **閮ㄧ讲鐗堟湰**锛歸eb/server 鍧囦负 **v1.1.13**锛堥暅鍍忔瀯寤?2026-09-17锛屼唬鐮佷笌闀滃儚涓€鑷村凡鏍稿锛?  - v1.1.11锛氫慨澶嶃€屼笂浼犵洰鏍囩洰褰曞凡鍒犻櫎銆?04 椋庢毚锛堢珛鍗冲け璐?+ 鏁存壒娓呯悊 + 鎸夌洰褰曟殏鍋滐級
-  - v1.1.12锛氬叏鍔熻兘浣撴 33 椤归€氳繃锛涗慨澶嶄换鍔￠潰鏉?z-index 閬尅琛屽唴涓嬫媺鑿滃崟
-  - v1.1.13锛氬埛鏂板悗澶辫触浠诲姟鍙€岄噸鏂伴€夋嫨鏂囦欢銆嶆柇鐐圭画浼狅紱retryTask/鎵归噺閲嶈瘯瑙ｉ櫎闃熷垪鏆傚仠锛?    灏忔枃浠惰嚜鍔ㄧ画浼犱笉鍐嶄骇鐢熼噸澶嶄换鍔★紙璇﹁ CHANGELOG锛?- Docker VM锛?GB / 4 鏍革紙`.wslconfig`锛夛紱闀滃儚鍔犻€?`docker.m.daocloud.io`
-- **浠ｇ爜浠撳簱锛氬凡鍒濆鍖?git 骞舵帹閫?GitHub** 鈥斺€?https://github.com/474lilin/netdisk锛圥ublic锛?  - 鏈湴鐩綍 `N:\濂囨€濆鎯砛minio-netdisk`锛涜繙绔?`origin`
-  - `.gitignore` 宸叉帓闄?`.env`/澶囦唤/娴嬭瘯娈嬬暀/鏈満 override锛?env 浠呭瓨鏈湴锛屼笉鍏ュ簱锛?  - 鎺ㄩ€佸懡浠わ細`git add -A && git commit -m "..." && git push`
-- 澶囦唤鏂瑰紡锛歚docs/04-澶囦唤涓庢仮澶?md`锛坧g_dump + mc mirror锛夛紱
-  2026-09-17 娓呯悊鍓嶅浠斤細`E:\netdisk-backups\nd-pre-cleanup-20260917-1305.dump`锛?.1MB锛?
-## 2. 寮€鏈洪噸鍚楠?
+- 脚本判定依据（逐一验证，不猜）：文件对象用 `files.size_bytes` + `files.sha256`（B3SEG）；
+  去重池对象用 `dedup_pool.size_bytes` + key 末尾的 sha256 段。
+  支持单盘布局的 `part.1…part.N` 分片拼接与小对象"内联在 xl.meta 尾部"两种形态。
+- 产物：`E:\netdisk-backups\recovery-plan.json`（回传计划）、`recovery-missing.csv`（救不回来的对象）、
+  `lost-manifest.csv`（2587 个丢失文件的完整路径/大小，供对照本地原件重传）。
+- 自测记录：`node e2e/tmp/_rescue-selftest.mjs` → 分片对象与内联对象均恢复、错误内容被拒、
+  拼接结果与原始字节完全一致；`restore` 通道实测 2/2 上传成功。
+
+### 永久禁令（写死在这里，避免重犯）
+1. **禁止** `mc rm --recursive --force --versions --stdin <alias>/<bucket>` 这种"清单+递归"组合；
+   版本化桶下删除**必须逐 key 指定完整路径**：`mc rm --recursive --force --versions nd/netdisk-data/<key>`。
+2. 任何批量删除前必须先跑**数据库反查**（files / file_versions / upload_sessions / dedup_pool / sha256 派生
+   六条通道全部 0 引用），并用 `--dry-run` 或临时桶验证**命令形式本身**，而不是只验证清单内容。
+3. 大清理前先做 `pg_dump` + **对象镜像**（`mc mirror`），不要只备份元数据。
+
+## 1. 当前状态快照（2026-09-17 核对）
+
+- 5 容器：`netdisk-server` / `netdisk-web` / `netdisk-minio` / `netdisk-postgres` / `netdisk-redis`（全部 healthy）
+- **MinIO 拓扑：单盘**（默认命名卷 `minio-data`；本地 override 单盘 bind 到 `N:\minio-data-single`；
+  旧 4 盘纠删码数据在 `N:\minio-data\data1..4` 已不再读取，确认无需后可删除释放空间）
+- **Redis 热点缓存**：目录列表（`dir:{orgId}:{userId}:{dirId}`，TTL 30s）+ 分享元信息（`share:{token}`，TTL 15s/到期精确）；写操作主动失效；权限实时校验不缓存
+- **PostgreSQL 实际数据**（2026-09-17 备份前实测）：`files=2587`（活跃，67GB）、`directories=588`、
+  回收站 152 项（11GB）、`dedup_pool=1496`（58GB）、`users=2`（admin 管理员 + demo 演示账号）
+  - 注：2026-08-27 曾按用户确认清空全部数据（含 21k 测试目录），此后为新一轮真实上传数据
+- **MinIO 侧对象**：`31634 Objects / 52687 Versions / 18322 Delete Markers`（清理前）
+- **部署版本**：web/server 均为 **v1.1.13**（镜像构建 2026-09-17，代码与镜像一致已核对）
+  - v1.1.11：修复「上传目标目录已删除」404 风暴（立即失败 + 整批清理 + 按目录暂停）
+  - v1.1.12：全功能体检 33 项通过；修复任务面板 z-index 遮挡行内下拉菜单
+  - v1.1.13：刷新后失败任务可「重新选择文件」断点续传；retryTask/批量重试解除队列暂停；
+    小文件自动续传不再产生重复任务（详见 CHANGELOG）
+- Docker VM：6GB / 4 核（`.wslconfig`）；镜像加速 `docker.m.daocloud.io`
+- **代码仓库：已初始化 git 并推送 GitHub** —— https://github.com/474lilin/netdisk（Public）
+  - 本地目录 `N:\奇思妙想\minio-netdisk`；远端 `origin`
+  - `.gitignore` 已排除 `.env`/备份/测试残留/本机 override（.env 仅存本地，不入库）
+  - 推送命令：`git add -A && git commit -m "..." && git push`
+- 备份方式：`docs/04-备份与恢复.md`（pg_dump + mc mirror）；
+  2026-09-17 清理前备份：`E:\netdisk-backups\nd-pre-cleanup-20260917-1305.dump`（7.1MB）
+
+## 2. 开机重启步骤
+
 ```powershell
-# 1) 鍚姩 Docker Desktop锛岀瓑寰呭紩鎿庡氨缁紙鎵樼洏鍥炬爣鍙樼豢锛?# 2) 鍚姩鏁村鏈嶅姟锛堜唬鐮佹棤鏀瑰姩鍒欐棤闇€ --build锛涙湁鏀瑰姩鐢?--build锛?cd N:\濂囨€濆鎯砛minio-netdisk
+# 1) 启动 Docker Desktop，等待引擎就绪（托盘图标变绿）
+# 2) 启动整套服务（代码无改动则无需 --build；有改动用 --build）
+cd N:\奇思妙想\minio-netdisk
 docker compose up -d
-# 3) 绛夊緟鍋ュ悍锛堢害 30-60s锛?docker compose ps          # 鍏ㄩ儴 healthy 鍗冲彲
+# 3) 等待健康（约 30-60s）
+docker compose ps          # 全部 healthy 即可
 curl http://127.0.0.1:8080/api/health   # {"ok":true,"db":true,"minio":true}
 ```
 
-> 璇存槑锛歚docker-compose.override.yml` 褰撳墠灏?MinIO 鏁版嵁 bind 鍒?N: 鐩橈紙10GB 瀹炴祴鐢ㄤ复鏃堕厤缃級銆?> 鑻?C: 鐩樼┖闂村厖瓒冲彲鍒犻櫎璇ユ枃浠舵仮澶嶉粯璁ゅ懡鍚嶅嵎锛堟洿蹇級锛汵: 鐩樺墿浣欑害 52GB銆?> 閲嶅缓 server 瀹瑰櫒鏃犻渶閲嶅惎 web锛歯ginx 宸查厤缃姩鎬佽В鏋愶紙resolver 127.0.0.11 + 鍙橀噺 proxy_pass锛夛紝
-> 鏈€闀?10s 鍐呰嚜鍔ㄦ仮澶嶏紙瑙佺 7 鑺?nginx 鍔ㄦ€佽В鏋?锛夈€?
-## 3. 寮€鏈哄悗蹇€熷洖褰掞紙鎸夐渶锛?
+> 说明：`docker-compose.override.yml` 当前将 MinIO 数据 bind 到 N: 盘（10GB 实测用临时配置）。
+> 若 C: 盘空间充足可删除该文件恢复默认命名卷（更快）；N: 盘剩余约 52GB。
+> 重建 server 容器无需重启 web：nginx 已配置动态解析（resolver 127.0.0.11 + 变量 proxy_pass），
+> 最长 10s 内自动恢复（见第 7 节"nginx 动态解析"）。
+
+## 3. 开机后快速回归（按需）
+
 ```powershell
-# 鍘婚噸涓撻」锛圓-E锛岀害 5-6 鍒嗛挓锛?node deploy/scripts/smoke-dedup.mjs
-# Redis 缂撳瓨涓撻」锛堢害 1 鍒嗛挓锛?node deploy/scripts/smoke-redis-cache.mjs
-# 600MB 鍥炲綊
+# 去重专项（A-E，约 5-6 分钟）
+node deploy/scripts/smoke-dedup.mjs
+# Redis 缓存专项（约 1 分钟）
+node deploy/scripts/smoke-redis-cache.mjs
+# 600MB 回归
 node deploy/scripts/smoke-b3-600.mjs
-# 涓婁紶/涓嬭浇鍚炲悙鍩虹嚎
+# 上传/下载吞吐基线
 node deploy/scripts/bench-io.mjs 512
-# 10GB BLAKE3 鍩哄噯
+# 10GB BLAKE3 基准
 node deploy/scripts/bench-b3.mjs
-# 娴忚鍣?e2e
+# 浏览器 e2e
 cd e2e && node browser-e2e.mjs
-# 鍒锋柊鍚庨噸璇曚慨澶嶄笓椤癸紙v1.1.13锛?脳40MB + 6MB 涓婁紶涓埛鏂?鈫?閲嶉€夋枃浠舵柇鐐圭画浼狅紝绾?2-4 鍒嗛挓锛?cd e2e && node _ui-retry-after-refresh.mjs
-# 鏂偣璁板綍鍐欏叆鏍告煡锛圛ndexedDB锛涘惈"姹℃煋搴撹嚜鎰?鍦烘櫙锛?cd e2e && node _probe-resume-idb.mjs
-# 瀛樺偍瀹屾暣鎬ф牳楠岋紙瀵圭収鏁版嵁搴撴牳瀵规瘡涓瓨娲绘枃浠剁殑瀵硅薄鍙鎬?+ 鎶芥牱 B3SEG 鍝堝笇锛岀害 5-8 鍒嗛挓锛?#   鍓嶇疆锛氶渶鍏堢敓鎴愭竻鍗曪紙瑙?docs/04-澶囦唤涓庢仮澶?md 鎴?CHANGELOG v1.1.13 璇存槑锛?cd e2e && node _verify-storage-integrity.mjs
-# 鍥炴敹绔?鏂囦欢椤垫壒閲忔搷浣滃垎鎵瑰洖褰掞紙閫?105 鐩綍鈫掑叏閫夊垹闄も啋鍏ㄩ€夊交搴曞垹闄も啋娓呯┖锛岀害 2 鍒嗛挓锛?cd e2e && node _trash-batch-full.mjs
-# 浣撻獙鏂█鍥炲綊锛堣〃鍗曟牎楠?鎸夐挳鎬?鏉冮檺/鍗忚寮圭獥/绉诲姩绔紝绾?1 鍒嗛挓锛?cd e2e && node _ux-assert.mjs
-# 鍒嗕韩椤典笓椤癸紙闈㈠寘灞戝鑸?鐩綍鍐呬笅杞?鏃犳晥鍒嗕韩鍖哄垎锛岀害 1 鍒嗛挓锛?cd e2e && node _share-ux.mjs
-# 鍏ㄥ QA锛堢害 40-60 鍒嗛挓锛汿4 鍚?520 鏂囦欢涓婁紶绾?12-18 鍒嗛挓锛?node deploy/scripts/_qa-t1.mjs; node deploy/scripts/_qa-t2.mjs; node deploy/scripts/_qa-t3.mjs
+# 刷新后重试修复专项（v1.1.13：2×40MB + 6MB 上传中刷新 → 重选文件断点续传，约 2-4 分钟）
+cd e2e && node _ui-retry-after-refresh.mjs
+# 断点记录写入核查（IndexedDB；含"污染库自愈"场景）
+cd e2e && node _probe-resume-idb.mjs
+# 存储完整性核验（对照数据库核对每个存活文件的对象可读性 + 抽样 B3SEG 哈希，约 5-8 分钟）
+#   前置：需先生成清单（见 docs/04-备份与恢复.md 或 CHANGELOG v1.1.13 说明）
+cd e2e && node _verify-storage-integrity.mjs
+# 回收站/文件页批量操作分批回归（造 105 目录→全选删除→全选彻底删除→清空，约 2 分钟）
+cd e2e && node _trash-batch-full.mjs
+# 体验断言回归（表单校验/按钮态/权限/协议弹窗/移动端，约 1 分钟）
+cd e2e && node _ux-assert.mjs
+# 分享页专项（面包屑导航/目录内下载/无效分享区分，约 1 分钟）
+cd e2e && node _share-ux.mjs
+# 全套 QA（约 40-60 分钟；T4 含 520 文件上传约 12-18 分钟）
+node deploy/scripts/_qa-t1.mjs; node deploy/scripts/_qa-t2.mjs; node deploy/scripts/_qa-t3.mjs
 cd e2e && node _qa-t4.mjs; cd ..; node deploy/scripts/_qa-t5.mjs
 ```
 
-## 4. 宸插畬鎴愮殑寮€鍙戝唴瀹癸紙鎴嚦 Redis 缂撳瓨锛?
-> 瀹屾暣鍗囩骇璁板綍瑙佹牴鐩綍 **CHANGELOG.md**锛堟瘡娆″彂甯冪殑鍔熻兘/淇/閰嶇疆鍙樻洿锛屾寜鐗堟湰褰掓。锛夛紱鏈枃鎸夊姛鑳藉綊绫汇€?
-1. **BLAKE3/B3SEG 鍏ㄩ摼璺?*锛歚server/src/lib/blake3.ts`锛坵orker_threads 骞惰锛? `web/src/utils/hash.ts`
-   锛圵eb Worker锛? 娴嬭瘯鍙傝€?`deploy/scripts/lib/blake3seg.mjs`銆傛柟妗堬細`BLAKE3(BLAKE3(seg0)||...)`锛?MB 鍒嗙墖锛?*鈮?b3sum**銆?2. **涓ょ骇鍐呭瓨缂撳瓨**锛歚server/src/lib/segmentCache.ts`锛堟鏁版嵁 LRU + 娈靛搱甯岀紦瀛橈紝`HASH_CACHE_MB`锛夈€?3. **MinIO 鍗曠洏浼樺寲**锛歞ocker-compose 榛樿鍗曠洏鍛藉悕鍗凤紙4 鐩樼籂鍒犵爜浠呭鍧楃嫭绔嬬墿鐞嗙洏鎵嶆湁鎰忎箟锛夈€?4. **QA 鍏ㄥ姛鑳芥祴璇曪紙73/73 鍏ㄧ豢锛?*锛氳瑙?`docs/QA-娴嬭瘯鎶ュ憡.md`銆?5. **鏁版嵁搴撴煡璇紭鍖?*锛歱g_trgm GIN 绱㈠紩锛坄idx_files_name_trgm`锛屽疄娴?5 涓囪 35ms鈫?ms锛?-49x锛?   + 鐩綍 path 鍓嶇紑 btree 绱㈠紩锛坄idx_directories_path_pattern`锛夛紝宸插浐鍖栧埌 `deploy/postgres/init/01-schema.sql`銆?6. **Redis 鐑偣缂撳瓨**锛堢敤鎴峰喅绛栵細涓?Redis 瀹瑰櫒 + 涓嶅仛鏉冮檺缂撳瓨锛夛細
-   - `server/src/lib/cache.ts`锛歩oredis 灏佽锛圱TL/鍓嶇紑鍒犻櫎/闈欓粯闄嶇骇鈥斺€擱edis 涓嶅彲鐢ㄦ椂涓氬姟鐩存帴钀藉簱锛?   - 鐩綍鍒楄〃锛歚listDir` 浠呯紦瀛?items锛堟潈闄愬疄鏃舵牎楠岋級锛岄敭 `dir:{orgId}:{userId}:{dirId}`锛?*鍚?userId**锛?     鍒楄〃椤规惡甯︽寜鐢ㄦ埛 ACL 瑙ｆ瀽鐨勬潈闄愭憳瑕侊紝涓嶅彲璺ㄧ敤鎴峰叡浜級锛孴TL 30s
-   - 鍐欐搷浣滀富鍔ㄥけ鏁堬細mkdir / rename / move / copy / deleteToTrash / restore / purge / completeUpload
-     锛堝け鏁堟搷浣滅洰褰?+ 鐖剁洰褰?+ 瀛愭爲锛?   - 鍒嗕韩鍏冧俊鎭細`getShareMeta` 缂撳瓨闈欐€佸瓧娈碉紙瀵嗙爜/鏈夋晥鏈熶笂闄?鍚嶇О/鎵€鏈夎€咃級锛岄敭 `share:{token}`锛?     TTL 15s锛堟湁鍒版湡鏃堕棿鍒欑簿纭埌鍒版湡鏃跺埢锛夛紱璁块棶璁℃暟**涓嶇紦瀛?*锛堝疄鏃舵煡璇紝淇濊瘉娆℃暟涓婇檺绮剧‘锛夛紱
-     `revokeShare` 绔嬪嵆澶辨晥
-7. **娴嬭瘯涓彂鐜板苟淇鐨?6 涓棶棰橈紙鍏ㄩ儴宸查儴缃查獙璇侊級**锛?   | # | 绾у埆 | 闂 | 淇 |
+## 4. 已完成的开发内容（截至 Redis 缓存）
+
+> 完整升级记录见根目录 **CHANGELOG.md**（每次发布的功能/修复/配置变更，按版本归档）；本文按功能归类。
+
+1. **BLAKE3/B3SEG 全链路**：`server/src/lib/blake3.ts`（worker_threads 并行）+ `web/src/utils/hash.ts`
+   （Web Worker）+ 测试参考 `deploy/scripts/lib/blake3seg.mjs`。方案：`BLAKE3(BLAKE3(seg0)||...)`，8MB 分片，**≠ b3sum**。
+2. **两级内存缓存**：`server/src/lib/segmentCache.ts`（段数据 LRU + 段哈希缓存，`HASH_CACHE_MB`）。
+3. **MinIO 单盘优化**：docker-compose 默认单盘命名卷（4 盘纠删码仅多块独立物理盘才有意义）。
+4. **QA 全功能测试（73/73 全绿）**：详见 `docs/QA-测试报告.md`。
+5. **数据库查询优化**：pg_trgm GIN 索引（`idx_files_name_trgm`，实测 5 万行 35ms→4ms，8-49x）
+   + 目录 path 前缀 btree 索引（`idx_directories_path_pattern`），已固化到 `deploy/postgres/init/01-schema.sql`。
+6. **Redis 热点缓存**（用户决策：上 Redis 容器 + 不做权限缓存）：
+   - `server/src/lib/cache.ts`：ioredis 封装（TTL/前缀删除/静默降级——Redis 不可用时业务直接落库）
+   - 目录列表：`listDir` 仅缓存 items（权限实时校验），键 `dir:{orgId}:{userId}:{dirId}`（**含 userId**：
+     列表项携带按用户 ACL 解析的权限摘要，不可跨用户共享），TTL 30s
+   - 写操作主动失效：mkdir / rename / move / copy / deleteToTrash / restore / purge / completeUpload
+     （失效操作目录 + 父目录 + 子树）
+   - 分享元信息：`getShareMeta` 缓存静态字段（密码/有效期上限/名称/所有者），键 `share:{token}`，
+     TTL 15s（有到期时间则精确到到期时刻）；访问计数**不缓存**（实时查询，保证次数上限精确）；
+     `revokeShare` 立即失效
+7. **测试中发现并修复的 6 个问题（全部已部署验证）**：
+   | # | 级别 | 问题 | 修复 |
    |---|---|---|---|
-   | 1 | P1 | 鍓嶇涓婁紶浠诲姟 N虏 鑶ㄨ儉锛坆eforeUpload 浼犳暣鎵?fileList锛?| 閫愭枃浠跺叆闃燂紙web 宸查噸寤猴級 |
-   | 2 | P1 | 骞跺彂鍚屽悕 complete 绔炴€?500锛圥G 浜嬪姟 aborted锛?| 鍐茬獊鍥炴粴鈫掓柊浜嬪姟閲嶈瘯 |
-   | 3 | P2 | 瀛ゅ効姹犲瓨鍌ㄦ硠婕忥紙鐪熷疄涓婁紶姹犲壇鏈笉娓呯悊锛屽疄娴?1.65GB锛?| **缂撳瓨+GC 璁捐**锛氭睜淇濈暀 30 澶╋紙POOL_GC_DAYS锛変緵鍒犻櫎鍚庣浼狅紝姣忔棩 GC 娓呯悊瓒呮湡闆跺紩鐢ㄦ睜 |
-   | 4 | P2 | 鏂囦欢鍚?URL 缂栫爜绌胯秺鏈嫤鎴紙%2F/%5C/%00/CRLF 娉ㄥ叆锛?| decode 鍚庝簩娆℃牎楠岋紙寰幆 3 杞級+ 鎺у埗瀛楃鎷︽埅 |
-   | 5 | P3 | 棰勮鍝嶅簲 Content-Type 渚濊禆涓婁紶 mime锛坥ctet-stream 涓嶅綋锛?| 鎸夋墿灞曞悕寮哄埗 response-content-type锛圥REVIEW_MIME锛?|
-   | 6 | P3 | 澶у璞″搱甯岃鍙栧苟鍙戜笉瓒筹紙3 璺級 | 鎻愬崌鑷?6 璺紙104鈫?29 MB/s锛?|
-8. **nginx 鍙嶄唬鍔ㄦ€佽В鏋愶紙鏍规不 server 閲嶅缓鍚?502锛?*锛歚/api/` 鏀?`resolver 127.0.0.11` + 鍙橀噺
-   `proxy_pass $backend`锛涘疄娴嬪己鍒?server 鎹?IP 鍚庢棤闇€閲嶅惎 web銆佲墹10s 鑷姩鎭㈠锛堣绗?7 鑺傦級銆?9. **鏁版嵁搴撶储寮曡ˉ鍏咃紙10 涓囪 files + 5 涓囪 dirs 瀹炴祴锛?*锛?   - 閰嶉缁熻锛氭柊澧?`idx_files_owner_size (owner_id, size_bytes)`锛?*涓嶅甫璋撹瘝**鈥斺€斿洖鏀剁珯鏂囦欢浠嶅崰鐢?     閰嶉锛屼笌"鍒犻櫎杩涘洖鏀剁珯涓嶆墸鍑忋€佸交搴曞垹闄ゆ墠鎵ｅ噺"璇箟涓€鑷达級锛屽疄娴?Index Only Scan 26.7ms 鈫?0.3ms锛垀88x锛?   - files 鐩綍鍒楄〃锛氬垹闄ゅ啑浣?`idx_files_dir`锛堣 `uq_files_dir_name (dir_id,name) WHERE is_deleted=false`
-     閮ㄥ垎鍞竴绱㈠紩瀹屽叏瑕嗙洊锛歞ir 绛夊€?+ name 鎺掑簭 + 杞垹闄よ繃婊わ級锛屽疄娴?0.356ms 鈫?0.185ms
-   - 鈶?鏂囦欢鍚嶆悳绱?`idx_files_name_trgm`锛堜笂杞凡寤猴級銆佲憿 鐩綍 path 鍓嶇紑
-     `idx_directories_path_pattern`锛堜笂杞凡寤猴級缁?5 涓囪瀹炴祴纭鐢熸晥锛坆tree pattern 0.91ms锛?     鍓嶇紑鏌ヨ浼樹簬 GIN trgm鈥斺€擥IN 浠呭涓棿鍖归厤鏈夋晥鑰岃矾寰勬煡璇㈠叏鏄墠缂€锛?*涓嶅缓 GIN**锛?   - 鐢ㄦ埛鍘熺淇锛歚files(parent_id,...)` 涓嶅瓨鍦ㄨ鍒楋紙鐩綍褰掑睘涓?dir_id锛夛紱`size` 搴斾负 `size_bytes`
-10. **鍥炴敹绔欒嚜鍔ㄦ竻鐞嗗畬鍠?*锛坄trash.service.ts` + `scheduler/index.ts`锛夛細
-   - 鍘熷凡鍏峰锛氭瘡鏃ユ竻鐞?+ 30 澶╋紙TRASH_RETENTION_DAYS锛? 閫愪釜 MinIO 鍒犻櫎 + DB 纭垹闄?+ 鐩綍瀛愭爲娓呯悊
-   - 鏈琛ラ綈锛?*瀹¤鐣欑棔**锛坄writeSystemAudit`锛氱郴缁熺骇浠诲姟鏃?HTTP 涓婁笅鏂囷紝鐩存帴 INSERT audit_logs锛?     `trash_purge_file`/`trash_purge_dir`锛宒etail 鍚?name/size/objectRemoved/retentionDays/subtreeFiles锛?   - **鏃堕棿浠庡噷鏅?2 鐐规敼涓哄噷鏅?3 鐐?*锛坄'0 3 * * *'`锛屼笌閰嶉閲嶇畻鍚屽垎閽燂紱瀵?used_bytes 鐨勫啓鍏ュ湪
-     READ COMMITTED 涓嬩簰涓嶉樆濉烇紝鏋佺浜ゅ弶鐢辨鏃ラ噸绠楁牎姝ｏ級
-   - 瀹炴祴锛?1 澶╁墠鏂囦欢/鐩綍琚竻锛圖B 琛?+ MinIO 瀵硅薄鍧囨秷澶便€乽sed_bytes 鎵ｅ噺銆佸璁?5 鏉★級銆?     29 澶╁墠鏂囦欢淇濈暀
-11. **鍓嶇涓夊潡浼樺寲锛堥灞?/ 涓婁紶杩涘害 / 鍒楄〃浜や簰锛屾祻瑙堝櫒瀹炴祴锛?*锛?   - 棣栧睆锛氳矾鐢辩骇 React.lazy + Suspense锛? 涓〉闈㈢嫭绔?chunk 0.3-10KB锛夛紱`FilePreview` 鎳掑姞杞?     鈥斺€攑dfjs/xlsx/docx锛坧review chunk 874KB + pdf.worker 1.3MB锛変笉鍐嶈繘棣栧睆锛沬ndex.html 鍔?boot-splash
-     鍗犱綅銆傞灞?JS 绾﹀噺 840KB+
-   - 涓婁紶杩涘害锛歚fileHash` 鏀寔鍒嗙墖杩涘害鍥炶皟锛堝ぇ鏂囦欢鍝堝笇闃舵鏄剧ず鐪熷疄杩涘害锛夛紱闃熷垪鏄剧ず瀹炴椂閫熺巼
-     锛坕nterval 宸垎锛夛紱鍏ㄩ儴鎴愬姛 2.5s 鍚庤嚜鍔ㄦ敹璧?   - 鍒楄〃浜や簰锛氭湰鍦板嵆鏃惰繃婊わ紙杈撳叆鍗崇瓫锛屼笉璋冨悗绔級锛涘悕绉?澶у皬/鏃堕棿鍒楁帓搴忥紙鐐瑰嚮鍒楀ご锛夛紱
-     澶х洰褰曪紙>400 椤癸級鑷姩鍚敤 rc-table 铏氭嫙婊氬姩锛坰croll.y 蹇呴』涓?*鏁板瓧**锛屽瓧绗︿覆 calc 浼氳嚧
-     body 涓嶆覆鏌擄級锛涜繃婊ゅ悗鏃犳晥閫夋嫨閿嚜鍔ㄥ墧闄?   - 椤烘墜淇锛歛ntd `destroyOnClose`鈫抈destroyOnHidden`锛? 澶勶級銆丼pin tip nest 鐢ㄦ硶锛堟秷鎺у埗鍙拌鍛婏級
-   - 瀹炴祴锛?00 鏂囦欢鐩綍 DOM 浠呮覆鏌?12 琛屻€佹粴鍔ㄥ埌搴曞彲瑙?doc_0500锛涜繃婊?1 琛屽懡涓紱鎺掑簭鍗?闄嶅簭姝ｇ‘锛?     鍝堝笇闃舵鏍囩鍑虹幇锛涢槦鍒楄嚜鍔ㄦ敹璧凤紱鏃犳帶鍒跺彴閿欒
-12. **鐩戞帶鍛婅锛圧edis 鍐呭瓨 / 缂撳瓨鍛戒腑鐜?/ 娓呯悊浠诲姟鐘舵€侊級**锛?   - `monitor.service.ts`锛歚recordJobRun`锛坰cheduler 姣忎换鍔¤褰?monitor_job_runs锛夈€?     `runMonitorCheck`锛堟瘡 5 鍒嗛挓锛孧ONITOR_CHECK_CRON锛夛細Redis INFO 閲囬泦鍐呭瓨/鍛戒腑鐜囥€?     浠诲姟鍋滄粸璇勪及锛堟瘡鏃ヤ换鍔?26h / 姣忓皬鏃?2h 鏃犳垚鍔熷嵆鍛婅锛涙寔缁け璐ヤ篃鍛婅锛涜〃绌?= 璋冨害鍣ㄦ湭杩愯锛?   - 鍛婅鎸佷箙鍖栵細`monitor_alerts`锛堝悓 metric 鍘婚噸锛屾仮澶嶈嚜鍔ㄧ疆 inactive锛沗scheduler_not_running` 鍏ㄨ〃鍒ゆ椿锛?   - 绔偣锛歚/api/health` 闄勫姞 monitor 鎽樿锛堣鍐呭瓨缂撳瓨锛屾棤楂橀 Redis 璋冪敤锛夛紱
-     `/api/monitor/status`锛堢櫥褰曪級銆乣/api/monitor/check`锛堢鐞嗗憳鎵嬪姩瑙﹀彂锛?   - 閰嶇疆锛歁ONITOR_REDIS_MEM_PCT(80)銆丮ONITOR_HITRATE_MIN_SAMPLE(200)銆丮ONITOR_CHECK_CRON
-   - 瀹炴祴锛歳edis maxmemory 璋冭嚦 1MB 鈫?critical 鍛婅 鈫?鎭㈠ 256MB 鑷姩瑙ｉ櫎锛泂hare_cleanup 璁板綍
-     鏀?3 澶╁墠 鈫?job_stale critical 鈫?鎭㈠瑙ｉ櫎锛沺ool_gc 鎸佺画澶辫触 鈫?鍛婅锛涘仴搴风姸鎬佷笅 0 鍛婅
-13. **鍛婅閫氱煡娓犻亾锛堥拤閽?/ 浼佷笟寰俊 / 閭欢 / 閫氱敤 webhook锛?*锛?   - `lib/notify.ts`锛氬憡璀?*棣栨瑙﹀彂**锛坮aised锛変笌**鎭㈠**锛坮esolved锛夋椂閫氱煡锛屾寔缁憡璀︿笉閲嶅锛?     娓犻亾鏈厤缃嵆璺宠繃銆佸彲澶氶€夊悓鏃跺彂銆佸け璐ヤ粎璁版棩蹇椾笉褰卞搷涓绘祦绋?   - 閽夐拤鏈哄櫒浜猴紙markdown锛屾敮鎸佸姞绛?secret锛夈€佷紒涓氬井淇℃満鍣ㄤ汉锛坢arkdown锛夈€丼MTP 閭欢锛坣odemailer锛?     鏂颁緷璧栵級銆侀€氱敤 webhook锛圥OST JSON 浜嬩欢鏁扮粍锛?   - 閰嶇疆锛歚ALERT_DINGTALK_WEBHOOK/SECRET`銆乣ALERT_WECOM_WEBHOOK`銆乣ALERT_WEBHOOK_URL`銆?     `ALERT_SMTP_HOST/PORT/SECURE/USER/PASS`銆乣ALERT_MAIL_FROM/TO`
-   - 瀹炴祴锛堟湰鍦版帴鏀跺櫒绔埌绔級锛氬憡璀?+ 鎭㈠涓ゆ柟鍚?脳 4 娓犻亾鍏ㄩ儴閫佽揪锛宲ayload 鏍煎紡绗﹀悎鍚勫钩鍙拌鑼?     锛堥拤閽?浼佸井 markdown銆亀ebhook 浜嬩欢鏁扮粍銆侀偖浠?quoted-printable锛?   - 娉ㄦ剰锛氫慨鏀?.env 鍚庨噸寤哄墠鍏?`docker compose config` 鏍￠獙锛?env 涓?娉ㄩ噴涓庤祴鍊煎悓琛?鏄」鐩?     鍘熸湁椋庢牸锛堣祴鍊艰娉ㄩ噴銆侀潬 compose 榛樿鍏滃簳锛夛紝鍕胯鏀?14. **鎬ц兘娓呭崟閫愰」鏍告煡涓庤ˉ榻愶紙璺敱鎳掑姞杞?gzip/杩涘害鏉?铏氭嫙婊氬姩/鍒嗛〉/缂╃暐鍥撅級**锛?   - 鉁?璺敱鎳掑姞杞斤紙瀹屾垚椤?11锛夈€佲渽 gzip锛坣ginx 宸查厤缃紝瀹炴祴 Content-Encoding: gzip 鐢熸晥锛夈€?     鉁?涓婁紶杩涘害鏉★紙瀹屾垚椤?11锛夈€佲渽 铏氭嫙婊氬姩娓叉煋锛堝畬鎴愰」 11锛?   - 鈶?缁勪欢鎸夐渶鍔犺浇锛氳ˉ ShareModal/PermissionModal/VersionModal/MoveModal/UploadQueue 鈫?React.lazy
-     锛團ilePreview 宸叉噿鍔犺浇锛涘脊绐楀眬閮?Suspense 閬垮厤鏁撮〉 fallback锛?   - 鈶?**鏈嶅姟绔垎椤?*锛堟鍓嶈櫄鎷熸粴鍔ㄥ彧瑙ｅ喅娓叉煋銆乴istDir 浠嶅叏閲忚繑鍥?10 涓囨潯锛夛細listDir 鍔?     offset/limit锛堥粯璁?500锛屼笂闄?5000锛? total/hasMore锛?*缂撳瓨浠呴椤?*锛坥ffset=0锛夛紝鍐欐搷浣滃け鏁堢収鏃э紱
-     鍓嶇"鍔犺浇鏇村"鎸夐挳锛堝凡鏄剧ず x / total锛夈€傚疄娴?1200 鏂囦欢鐩綍锛?00/500/200 涓夐〉銆乭asMore 姝ｇ‘銆?     鎺掑簭绋冲畾锛坧gfile_0001鈫?501鈫?001锛?   - 鈶?**鍥剧墖缂╃暐鍥炬噿鍔犺浇**锛堟鍓嶅垪琛ㄥ彧鏈夊浘鏍囷級锛氭柊澧?ThumbImg 缁勪欢鈥斺€斿浘鐗囨枃浠讹紙鎵╁睍鍚嶅垽鏂級
-     鍦ㄥ悕绉板垪鏄剧ず缂╃暐鍥撅紝IntersectionObserver 杩涘叆瑙嗗彛鎵嶈姹傞瑙?URL锛坮ootMargin 200px 棰勫姞杞斤級锛?     URL 鎸夋枃浠剁紦瀛橈紙55min TTL 闃茬鍚嶈繃鏈燂級锛涘疄娴?canvas 鐢熸垚 PNG 涓婁紶鍚庡垪琛ㄦ覆鏌?<img>
-     naturalWidth>0銆乸review API 200
-   - 宸茬煡杈圭晫锛氬垎椤靛悗鏂颁笂浼犳枃浠惰嫢鎸?name 鎺掑湪澶х洰褰曢椤典箣澶栵紝闇€"鍔犺浇鏇村"/杩囨护鏌ョ湅锛堥椤靛埛鏂帮級
-   - 鍓嶇涓诲寘杩涗竴姝ョ缉灏忥細寮圭獥缁勪欢绉诲嚭锛堥灞?index chunk 绾?76KB 鈫?鏇村皬锛?15. **鍒嗕韩椤甸潰鐙珛锛堟棤鐧诲綍鎬佹煡鐪嬪垎浜摼鎺ワ級**锛?   - 鏋舵瀯鏈凡鏀寔锛歚/share/:token` 鍦?RequireAuth 涔嬪鐙珛璺敱锛涘垎浜?API
-     锛坢eta/verify/download/list锛夊湪鍏?CSRF 鍏紑缁?   - 瀹炴祴锛堟棤鐥曟祻瑙堝櫒涓婁笅鏂囷紝鏃犱换浣?cookie/token锛夛細鍗曟枃浠跺垎浜紙鎵撳紑/鏂囦欢鍚?涓嬭浇锛夈€?     鐩綍鍒嗕韩锛堟墦寮€/鐩綍鍚?鍒楄〃/鏂囦欢鍙锛夊叏閮ㄩ€氳繃锛屾棤 401銆佹棤鎺у埗鍙伴敊璇?   - 淇涓€涓竟鐣岋細鍒嗕韩鐩綍鍚浘鐗囨枃浠舵椂锛屽垪琛ㄥ鐢ㄧ殑 FileTable 浼氭覆鏌?ThumbImg 鈫?     璋冪敤闇€鐧诲綍鐨?preview API 鈫?鏃犵櫥褰?401 + 鎺у埗鍙板櫔闊炽€傛柊澧?`showThumbs` 寮€鍏?     锛堥粯璁?true锛夛紝鍒嗕韩椤典紶 false锛涘垎浜〉 document.title 璁句负鍒嗕韩鍚?   - 楠岃瘉锛氫慨澶嶅悗鍚浘鐗囩殑鐩綍鍒嗕韩鏃?401銆佺缉鐣ュ浘涓嶅啀瑙﹀彂闇€鐧诲綍璇锋眰
-16. **绉诲姩绔€傞厤锛堝搷搴斿紡锛?75px 瑙嗗彛瀹炴祴 14/14锛?*锛?   - `useMediaQuery` hook锛坄useIsMobile` <768px锛?   - MainLayout锛歋ider `breakpoint="md"` + `collapsedWidth={0}`锛堢Щ鍔ㄧ鑷姩鎶樺彔涓烘诞灞傦紝
-     姹夊牎鎸夐挳灞曞紑 + 鐐瑰嚮鑿滃崟椤硅嚜鍔ㄦ敹璧?+ 閬僵锛夛紱Header 鎼滅储妗嗗叏瀹姐€佺敤鎴峰悕/瑙掕壊绉诲姩绔殣钘?   - FileTable锛氱Щ鍔ㄧ闅愯棌"鎵€鏈夎€?鏇存柊鏃堕棿"鍒楋紙淇濈暀鍚嶇О+澶у皬+鎿嶄綔锛夛紝铏氭嫙婊氬姩鍒楀/scroll.x 鍔ㄦ€?   - FileBrowserPage锛氳繃婊ゆ绉诲姩绔叏瀹斤紱UploadQueue锛欴rawer 绉诲姩绔叏瀹斤紙100%锛?   - ShareViewPage锛氬崱鐗?`width:100% + maxWidth`锛汱oginPage锛氱櫥褰曞崱 `calc(100vw-32px)`
-   - styles.css 鍔?`@media (max-width:768px)`锛堢櫥褰曞崱/鍐呭 padding/闃熷垪绱у噾锛?   - 瀹炴祴锛氱櫥褰曞崱 343px 涓嶈秴瑙嗗彛銆佷晶杈规爮鎶樺彔 1px銆佹眽鍫″睍寮€ 220px銆佽〃鏍煎垪绮剧畝銆佹棤妯悜婊氬姩銆?     涓婁紶闃熷垪鍏ㄥ 375銆佸垎浜崱鐗囪嚜閫傚簲銆佹闈?1440 鍥炲綊锛堝垪淇濈暀锛?17. **鎬ц兘鍘嬫祴锛坘6锛?00 骞跺彂 脳 30s锛変笌 cluster 澶氳繘绋嬩紭鍖?*锛?   - 鑴氭湰锛歚deploy/scripts/k6/{health,static,api-list}.js`锛坘6 瀹瑰櫒 join 瀹瑰櫒缃戠粶鍘嬫祴 nginx锛?   - 瀹炴祴鍩虹嚎锛? 鏍?VM锛夛細
-     | 鍦烘櫙 | 鍗曡繘绋?| cluster 4 worker | 璇存槑 |
+   | 1 | P1 | 前端上传任务 N² 膨胀（beforeUpload 传整批 fileList） | 逐文件入队（web 已重建） |
+   | 2 | P1 | 并发同名 complete 竞态 500（PG 事务 aborted） | 冲突回滚→新事务重试 |
+   | 3 | P2 | 孤儿池存储泄漏（真实上传池副本不清理，实测 1.65GB） | **缓存+GC 设计**：池保留 30 天（POOL_GC_DAYS）供删除后秒传，每日 GC 清理超期零引用池 |
+   | 4 | P2 | 文件名 URL 编码穿越未拦截（%2F/%5C/%00/CRLF 注入） | decode 后二次校验（循环 3 轮）+ 控制字符拦截 |
+   | 5 | P3 | 预览响应 Content-Type 依赖上传 mime（octet-stream 不当） | 按扩展名强制 response-content-type（PREVIEW_MIME） |
+   | 6 | P3 | 大对象哈希读取并发不足（3 路） | 提升至 6 路（104→129 MB/s） |
+8. **nginx 反代动态解析（根治 server 重建后 502）**：`/api/` 改 `resolver 127.0.0.11` + 变量
+   `proxy_pass $backend`；实测强制 server 换 IP 后无需重启 web、≤10s 自动恢复（见第 7 节）。
+9. **数据库索引补充（10 万行 files + 5 万行 dirs 实测）**：
+   - 配额统计：新增 `idx_files_owner_size (owner_id, size_bytes)`（**不带谓词**——回收站文件仍占用
+     配额，与"删除进回收站不扣减、彻底删除才扣减"语义一致），实测 Index Only Scan 26.7ms → 0.3ms（~88x）
+   - files 目录列表：删除冗余 `idx_files_dir`（被 `uq_files_dir_name (dir_id,name) WHERE is_deleted=false`
+     部分唯一索引完全覆盖：dir 等值 + name 排序 + 软删除过滤），实测 0.356ms → 0.185ms
+   - ② 文件名搜索 `idx_files_name_trgm`（上轮已建）、③ 目录 path 前缀
+     `idx_directories_path_pattern`（上轮已建）经 5 万行实测确认生效（btree pattern 0.91ms，
+     前缀查询优于 GIN trgm——GIN 仅对中间匹配有效而路径查询全是前缀，**不建 GIN**）
+   - 用户原稿修正：`files(parent_id,...)` 不存在该列（目录归属为 dir_id）；`size` 应为 `size_bytes`
+10. **回收站自动清理完善**（`trash.service.ts` + `scheduler/index.ts`）：
+   - 原已具备：每日清理 + 30 天（TRASH_RETENTION_DAYS）+ 逐个 MinIO 删除 + DB 硬删除 + 目录子树清理
+   - 本次补齐：**审计留痕**（`writeSystemAudit`：系统级任务无 HTTP 上下文，直接 INSERT audit_logs；
+     `trash_purge_file`/`trash_purge_dir`，detail 含 name/size/objectRemoved/retentionDays/subtreeFiles）
+   - **时间从凌晨 2 点改为凌晨 3 点**（`'0 3 * * *'`，与配额重算同分钟；对 used_bytes 的写入在
+     READ COMMITTED 下互不阻塞，极端交叉由次日重算校正）
+   - 实测：31 天前文件/目录被清（DB 行 + MinIO 对象均消失、used_bytes 扣减、审计 5 条）、
+     29 天前文件保留
+11. **前端三块优化（首屏 / 上传进度 / 列表交互，浏览器实测）**：
+   - 首屏：路由级 React.lazy + Suspense（8 个页面独立 chunk 0.3-10KB）；`FilePreview` 懒加载
+     ——pdfjs/xlsx/docx（preview chunk 874KB + pdf.worker 1.3MB）不再进首屏；index.html 加 boot-splash
+     占位。首屏 JS 约减 840KB+
+   - 上传进度：`fileHash` 支持分片进度回调（大文件哈希阶段显示真实进度）；队列显示实时速率
+     （interval 差分）；全部成功 2.5s 后自动收起
+   - 列表交互：本地即时过滤（输入即筛，不调后端）；名称/大小/时间列排序（点击列头）；
+     大目录（>400 项）自动启用 rc-table 虚拟滚动（scroll.y 必须为**数字**，字符串 calc 会致
+     body 不渲染）；过滤后无效选择键自动剔除
+   - 顺手修复：antd `destroyOnClose`→`destroyOnHidden`（7 处）、Spin tip nest 用法（消控制台警告）
+   - 实测：500 文件目录 DOM 仅渲染 12 行、滚动到底可见 doc_0500；过滤 1 行命中；排序升/降序正确；
+     哈希阶段标签出现；队列自动收起；无控制台错误
+12. **监控告警（Redis 内存 / 缓存命中率 / 清理任务状态）**：
+   - `monitor.service.ts`：`recordJobRun`（scheduler 每任务记录 monitor_job_runs）、
+     `runMonitorCheck`（每 5 分钟，MONITOR_CHECK_CRON）：Redis INFO 采集内存/命中率、
+     任务停滞评估（每日任务 26h / 每小时 2h 无成功即告警；持续失败也告警；表空 = 调度器未运行）
+   - 告警持久化：`monitor_alerts`（同 metric 去重，恢复自动置 inactive；`scheduler_not_running` 全表判活）
+   - 端点：`/api/health` 附加 monitor 摘要（读内存缓存，无高频 Redis 调用）；
+     `/api/monitor/status`（登录）、`/api/monitor/check`（管理员手动触发）
+   - 配置：MONITOR_REDIS_MEM_PCT(80)、MONITOR_HITRATE_MIN_SAMPLE(200)、MONITOR_CHECK_CRON
+   - 实测：redis maxmemory 调至 1MB → critical 告警 → 恢复 256MB 自动解除；share_cleanup 记录
+     改 3 天前 → job_stale critical → 恢复解除；pool_gc 持续失败 → 告警；健康状态下 0 告警
+13. **告警通知渠道（钉钉 / 企业微信 / 邮件 / 通用 webhook）**：
+   - `lib/notify.ts`：告警**首次触发**（raised）与**恢复**（resolved）时通知，持续告警不重复；
+     渠道未配置即跳过、可多选同时发、失败仅记日志不影响主流程
+   - 钉钉机器人（markdown，支持加签 secret）、企业微信机器人（markdown）、SMTP 邮件（nodemailer，
+     新依赖）、通用 webhook（POST JSON 事件数组）
+   - 配置：`ALERT_DINGTALK_WEBHOOK/SECRET`、`ALERT_WECOM_WEBHOOK`、`ALERT_WEBHOOK_URL`、
+     `ALERT_SMTP_HOST/PORT/SECURE/USER/PASS`、`ALERT_MAIL_FROM/TO`
+   - 实测（本地接收器端到端）：告警 + 恢复两方向 × 4 渠道全部送达，payload 格式符合各平台规范
+     （钉钉/企微 markdown、webhook 事件数组、邮件 quoted-printable）
+   - 注意：修改 .env 后重建前先 `docker compose config` 校验；.env 中"注释与赋值同行"是项目
+     原有风格（赋值被注释、靠 compose 默认兜底），勿误改
+14. **性能清单逐项核查与补齐（路由懒加载/gzip/进度条/虚拟滚动/分页/缩略图）**：
+   - ✅ 路由懒加载（完成项 11）、✅ gzip（nginx 已配置，实测 Content-Encoding: gzip 生效）、
+     ✅ 上传进度条（完成项 11）、✅ 虚拟滚动渲染（完成项 11）
+   - ② 组件按需加载：补 ShareModal/PermissionModal/VersionModal/MoveModal/UploadQueue → React.lazy
+     （FilePreview 已懒加载；弹窗局部 Suspense 避免整页 fallback）
+   - ⑤ **服务端分页**（此前虚拟滚动只解决渲染、listDir 仍全量返回 10 万条）：listDir 加
+     offset/limit（默认 500，上限 5000）+ total/hasMore；**缓存仅首页**（offset=0），写操作失效照旧；
+     前端"加载更多"按钮（已显示 x / total）。实测 1200 文件目录：500/500/200 三页、hasMore 正确、
+     排序稳定（pgfile_0001→0501→1001）
+   - ⑥ **图片缩略图懒加载**（此前列表只有图标）：新增 ThumbImg 组件——图片文件（扩展名判断）
+     在名称列显示缩略图，IntersectionObserver 进入视口才请求预览 URL（rootMargin 200px 预加载），
+     URL 按文件缓存（55min TTL 防签名过期）；实测 canvas 生成 PNG 上传后列表渲染 <img>
+     naturalWidth>0、preview API 200
+   - 已知边界：分页后新上传文件若按 name 排在大目录首页之外，需"加载更多"/过滤查看（首页刷新）
+   - 前端主包进一步缩小：弹窗组件移出（首屏 index chunk 约 76KB → 更小）
+15. **分享页面独立（无登录态查看分享链接）**：
+   - 架构本已支持：`/share/:token` 在 RequireAuth 之外独立路由；分享 API
+     （meta/verify/download/list）在免 CSRF 公开组
+   - 实测（无痕浏览器上下文，无任何 cookie/token）：单文件分享（打开/文件名/下载）、
+     目录分享（打开/目录名/列表/文件可见）全部通过，无 401、无控制台错误
+   - 修复一个边界：分享目录含图片文件时，列表复用的 FileTable 会渲染 ThumbImg →
+     调用需登录的 preview API → 无登录 401 + 控制台噪音。新增 `showThumbs` 开关
+     （默认 true），分享页传 false；分享页 document.title 设为分享名
+   - 验证：修复后含图片的目录分享无 401、缩略图不再触发需登录请求
+16. **移动端适配（响应式，375px 视口实测 14/14）**：
+   - `useMediaQuery` hook（`useIsMobile` <768px）
+   - MainLayout：Sider `breakpoint="md"` + `collapsedWidth={0}`（移动端自动折叠为浮层，
+     汉堡按钮展开 + 点击菜单项自动收起 + 遮罩）；Header 搜索框全宽、用户名/角色移动端隐藏
+   - FileTable：移动端隐藏"所有者/更新时间"列（保留名称+大小+操作），虚拟滚动列宽/scroll.x 动态
+   - FileBrowserPage：过滤框移动端全宽；UploadQueue：Drawer 移动端全宽（100%）
+   - ShareViewPage：卡片 `width:100% + maxWidth`；LoginPage：登录卡 `calc(100vw-32px)`
+   - styles.css 加 `@media (max-width:768px)`（登录卡/内容 padding/队列紧凑）
+   - 实测：登录卡 343px 不超视口、侧边栏折叠 1px、汉堡展开 220px、表格列精简、无横向滚动、
+     上传队列全宽 375、分享卡片自适应、桌面 1440 回归（列保留）
+17. **性能压测（k6，500 并发 × 30s）与 cluster 多进程优化**：
+   - 脚本：`deploy/scripts/k6/{health,static,api-list}.js`（k6 容器 join 容器网络压测 nginx）
+   - 实测基线（4 核 VM）：
+     | 场景 | 单进程 | cluster 4 worker | 说明 |
      |---|---|---|---|
-     | health锛圖B+MinIO 鎺㈡祴锛?| 577 RPS / P95 1.16s | 665 RPS / P95 1.02s | 澶栭儴渚濊禆搴忓垪鍖栵紝鎻愬崌鏈夐檺 |
-     | 闈欐€佽祫婧愶紙nginx gzip锛?| 6774 RPS / P95 141ms | 鈥?| 鏈€寮猴紝涓?server 鏃犲叧 |
-     | 鐧诲綍鎬佸垪鐩綍锛圝WT+DB+Redis锛?| 255 RPS / P95 3.78s | **351 RPS / P95 2.19s** | +38% / -42% |
-     鍏ㄩ儴 0 澶辫触锛?00 骞跺彂涓嬫棤閿欒鍝嶅簲锛?   - 鐡堕瀹氫綅锛歞ocker stats 瀹炴祴 server CPU 鍗曡繘绋?~120%锛堝崟鏍搁ケ鍜岋級銆丳G/Redis 浣庤礋杞?     鈫?**cluster 澶氳繘绋?*锛坄index.ts`锛氫富杩涚▼寮曞 + scheduler 鍗曞疄渚?+ 4 worker 鍏变韩绔彛锛?     worker 宕╂簝鑷姩鎷夎捣锛沗PG_POOL_MAX` 姣?worker 鍧囧垎锛沗WEB_CONCURRENCY` 鍙厤锛? = 鍏抽棴锛?   - cluster 鍚?worker CPU ~295%锛?/4 鏍告弧锛夆€斺€旂摱棰堝凡鍒?4 鏍?VM CPU 涓婇檺锛?     鏇撮珮鍚炲悙闇€鏇村鏍告垨鍑忓皯姣忚姹?CPU锛圝WT 楠岃瘉 + JSON 搴忓垪鍖栵級
-   - 鍥炲綊锛氱櫥褰?鍒楃洰褰?涓婁紶/涓嬭浇/鍒犻櫎鍏ㄩ儴閫氳繃锛泂cheduler 浠呬富杩涚▼鎵ц锛堟棤閲嶅浠诲姟锛?18. **蹇樿瀵嗙爜锛堥偖绠?/ 鐭俊鎵惧洖锛?*锛?   - 鍚庣 `password-reset.service.ts`锛氫粎鏈湴璐﹀彿锛圠DAP 鐢卞煙鍐呯鐞嗭級锛? 浣嶉獙璇佺爜 10 鍒嗛挓鏈夋晥銆?     鏈€澶?5 娆″皾璇曘€佹瘡璐﹀彿 1 灏忔椂 5 娆″彂閫?+ 60s 鍐峰嵈銆両P 闄愭祦锛涚粺涓€妯＄硦鍝嶅簲锛堜笉娉勯湶璐﹀彿
-     鏄惁瀛樺湪锛夛紱閲嶇疆鍚庡悐閿€鍏ㄩ儴浼氳瘽
-   - 閫氶亾锛氶偖绠憋紙SMTP锛孯ESET_MAIL_*锛? 鐭俊锛堣嚜寤虹綉鍏?webhook锛孯ESET_SMS_WEBHOOK POST
-     {phone, code}锛夛紱鏈厤缃€氶亾鏃跺墠绔彁绀?鑱旂郴绠＄悊鍛?
-   - 琛?`password_reset_codes`锛堢储寮?+ 姣忔棩娓呯悊淇濈暀 7 澶╋級锛涘璁?`password_reset`
-   - 鍓嶇锛歚/forgot-password` 鐙珛椤碉紙涓夋锛氳处鍙?閫氶亾 -> 楠岃瘉鐮?鏂板瘑鐮?-> 瀹屾垚锛夛紝鐧诲綍椤?     "蹇樿瀵嗙爜锛?鍏ュ彛锛涢€氶亾鍙敤鎬х敱 `/api/auth/password-reset/channels` 椹卞姩
-   - 瀹炴祴绔埌绔紙鏈湴 SMTP 鎺ユ敹鍣級锛氬彂鐮?-> 閭欢鏀跺埌 6 浣嶇爜锛坆ase64 姝ｆ枃瑙ｇ爜锛?> 閿欒鐮?400 ->
-     姝ｇ‘鐮侀噸缃?-> 鏂板瘑鐮佺櫥褰曟垚鍔?-> 楠岃瘉鐮佷竴娆℃€э紙澶嶇敤 400锛?> 鍘熷瘑鐮佸け鏁堬紱admin 瀵嗙爜宸叉仮澶?   - 鐢熶骇閰嶇疆锛?env 濉?`RESET_MAIL_HOST/PORT/SECURE/USER/PASS/FROM`锛堟垨 `RESET_SMS_WEBHOOK`锛夊悗
-     閲嶅缓 server 鍗崇敓鏁堬紱鐢ㄦ埛闇€鍦ㄧ鐞嗗彴缁存姢 email/phone 瀛楁
-19. **娉ㄥ唽/鐧诲綍瀹夊叏澧炲己锛堟牳蹇?8 椤癸紝绔埌绔疄娴?41 椤瑰叏缁匡級**锛?   - **鑷姪娉ㄥ唽** `/register`锛氶偖绠?鎵嬫満楠岃瘉鐮侊紙`verification_codes` 琛紝闄愭祦 1h5 娆?60s 鍐峰嵈銆?     涓€娆℃€с€? 娆″皾璇曪級+ 绠楁湳 CAPTCHA锛?*Redis 瀛樺偍**鈥斺€攃luster 澶?worker 鍏变韩锛岃繘绋嬪唴瀛樹細璺?     worker 澶辨晥锛? 瀵嗙爜寮哄害锛堚墺8 浣嶅惈瀛楁瘝鏁板瓧锛? 鐢ㄦ埛鍗忚蹇呴€夛紱閲嶅娉ㄥ唽/鏈悓鎰忓崗璁鎷?   - **澶氭柟寮忕櫥褰?*锛氳处鍙?閭/鎵嬫満鍙凤紙`username OR email OR phone`锛夛紱LDAP 璧板煙璁よ瘉
-   - **璐﹀彿閿佸畾**锛氳繛缁?5 娆″け璐ラ攣瀹?30 鍒嗛挓锛坄failed_attempts/locked_until`锛夛紝鍒版湡鑷姩瑙ｉ攣
-   - **2FA锛圱OTP锛?*锛歴peakeasy + qrcode锛堟柊渚濊禆锛夛紱璁剧疆鎵爜缁戝畾 鈫?鐧诲綍瀵嗙爜鍚庡彂鎸戞垬浠ょ墝
-     锛? 鍒嗛挓 JWT锛夆啋 鏍￠獙鍔ㄦ€佺爜瀹屾垚鐧诲綍锛坄finishAuth` 闇€璺宠繃 2FA 鍒嗘敮鍚﹀垯浜屾杩斿洖鎸戞垬鈥斺€斿凡淇級锛?     鍏抽棴闇€鍔ㄦ€佺爜+瀵嗙爜锛沗window:1` 瀹瑰繊鏃堕挓鍋忓樊
-   - **瀵嗙爜鎵惧洖鍗囩骇**锛氶獙璇佺爜 + **閲嶇疆閾炬帴**锛堜竴娆℃€с€?0 鍒嗛挓銆乣reset-password?token=` 椤碉級锛?     閲嶇疆鍚庡悐閿€鍏ㄩ儴浼氳瘽寮哄埗閲嶆柊鐧诲綍
-   - **瀵嗙爜鍘嗗彶**锛歚password_history` 琛ㄤ繚鐣欐渶杩?5 鏉★紝鏀瑰瘑/閲嶇疆绂侀噸澶嶄娇鐢?   - **璁惧绠＄悊**锛歚/api/auth/sessions` 鍒楄〃锛堝惈褰撳墠鏍囪锛? 韪笅绾匡紙鍚婇攢浼氳瘽锛?   - **寮傚父鐧诲綍妫€娴?*锛氱櫥褰曟椂瀵规瘮鏈€杩戜細璇?IP/UA 鍙樺寲 鈫?`risk` 鏍囪 + 鍓嶇鎻愮ず
-     锛堟棤 IP 鍦扮悊搴擄紝鐢ㄨ澶囩壒寰佽繎浼硷紱寮傚湴鍦扮悊搴?鏁版嵁瀵煎嚭/90 澶╁己鍒舵敼瀵嗗悗缃級
-   - 瀹炴祴锛氬畨鍏ㄦ祴璇?1锛堟敞鍐?澶氭柟寮?閿佸畾/璁惧锛?4 椤广€佸畨鍏ㄦ祴璇?2锛?FA/閲嶇疆閾炬帴/鍘嗗彶锛?6 椤广€?     鍓嶇娓叉煋 11 椤癸紝鍏ㄩ儴閫氳繃
-20. **鎵归噺鎿嶄綔鍒嗘壒淇锛堝洖鏀剁珯鍏ㄩ€変竴娆℃€у交搴曞垹闄わ級**锛?   - 鏍瑰洜锛氭壒閲忔帴鍙?`targets` 鍗曟涓婇檺 100锛堝悗绔槻婊ョ敤锛夛紝鍥炴敹绔?>100 椤瑰叏閫変竴娆℃€ф彁浜よ zod
-     鎷掔粷锛?00锛夆啋 鍙兘鍗曚釜鍒犻櫎
-   - 淇锛氬墠绔?*鍒嗘壒涓茶**锛堟瘡鎵?鈮?00锛夆€斺€擿TrashPage` 鎭㈠/褰诲簳鍒犻櫎銆乣FileBrowserPage`
-     鍒犻櫎/绉诲姩/澶嶅埗锛坄chunked`/`chunkedTargets`锛夛紱鎵归噺 `onOk` 琛?try/catch锛堝け璐ユ彁绀?+ 鍒锋柊
-     鍒楄〃锛岄槻纭寮圭獥鍗℃鏃犲弽棣堬級
-   - 瀹炴祴锛堟祻瑙堝櫒 e2e `e2e/_trash-batch-full.mjs`锛夛細API 閫?105 鐩綍锛?100锛夆啋 鏂囦欢椤靛叏閫?     105 琛?鈫?Popconfirm+Modal 涓ょ骇纭鏄剧ず 105 鈫?鍒嗘壒鍒犻櫎 鈫?鍥炴敹绔?105 椤?鈫?鍏ㄩ€夊交搴曞垹闄?     锛堢‘璁ゅ脊绐?105 椤癸級鈫?鍒嗘壒 purge 鈫?娓呯┖锛屽叏绋嬫棤鎺у埗鍙伴敊璇?21. **浣撻獙浼樺寲 v1.0.10锛堜唬鐮佸鏌?32 椤?+ 娴忚鍣ㄥ疄娴嬫暣鏀癸級**锛氳瑙?CHANGELOG v1.0.10銆?    - 鏍稿績锛歛pi 灞傜粺涓€ 30s 瓒呮椂 + 缃戠粶閿欒涓枃褰掍竴鍖栵紙鏍瑰洜锛夛紱瀵嗙爜寮哄害鍓嶇涓庡悗绔畬鍏ㄤ竴鑷?      锛坄web/src/utils/password.ts` 澶嶇敤 4 澶勶級锛涗笂浼?鏂板缓鎸夊啓鏉冮檺绂佺敤锛涙壒閲忓垹闄ゅ崟娆＄‘璁わ紱
-      涓婁紶瀹屾垚姹囨€婚€氱煡锛汳oveModal/鐗堟湰鍥炴粴/鏉冮檺鍒犻櫎闃查噸涓庡閿?    - 鍒嗕韩椤碉細鐩綍鍒嗕韩闈㈠寘灞戯紙鍚庣杩斿洖瀛愭爲鍐呯鍏堥摼锛屽彲鐐瑰嚮杩斿洖涓婄骇锛? 鐩綍鍐呮枃浠跺彲涓嬭浇
-      锛坉ownloadShare 鏀寔 fileId锛? 缃戠粶閿欒涓?鍒嗕韩涓嶅瓨鍦?鍖哄垎
-    - 瀹夊叏鎿嶄綔纭锛氬叧闂?2FA / 涓嬬嚎璁惧浜屾纭锛涙敞鍐岄〉楠岃瘉鐮?60s 鍊掕鏃躲€丆APTCHA 澶辫触閲嶈瘯銆?      鍗忚閾炬帴 stopPropagation
-    - 瀹炴祴锛歚e2e/_ux-assert.mjs`锛?8 椤癸級+ `e2e/_share-ux.mjs`锛?0 椤癸級鍏ㄧ豢
-22. **涓婁紶鎬ц兘浼樺寲 v1.0.11锛堢敤鎴峰疄娴?6 鏂囦欢 2.4s/涓?鈫?璇锋眰绾у墫鏋愰┍鍔級**锛?   - 鏍瑰洜锛氫笂浼犺姹傛湰韬粎 100-300ms/鏂囦欢锛涙氮璐瑰湪 鈶?鍓嶇姣忎换鍔″畬鎴愰兘鍒锋柊鍒楄〃
-     锛? 鏂囦欢 鈫?6 娆?GET 瀵癸紝~1.8s锛夆憽 BLAKE3 WASM 棣栨鍔犺浇锛垀100ms+锛夆憿 completeUpload
-     閲嶅 statObject锛? 娆?MinIO 寰€杩旓級
-   - 淇锛氫笂浼犲畬鎴愬埛鏂?*闃叉姈鍚堝苟**锛?00ms 绐楀彛涓€娆★級锛沗warmupHash()` 椤甸潰鍔犺浇鍚庨鐑?WASM锛?     completeUpload 鍚堝苟涓ゆ statObject 涓轰竴娆?   - 瀹炴祴锛?脳2KB 鍏ㄦ柊鍐呭锛夛細璇锋眰闃舵 ~1.3s 鍏ㄩ儴瀹屾垚 + 鍒楄〃鍒锋柊浠?1 娆★紙鍘?6 娆★級锛?     绉掍紶鍦烘櫙 init <500ms
-   - 娉ㄦ剰锛氱敤鎴峰凡涓婁紶鐪熷疄鏁版嵁锛堢害 950 娲昏穬鏂囦欢锛孭ython 椤圭洰鐩綍鏍戯級锛?*鍕挎竻鐞?*锛?     娴嬭瘯娈嬬暀鍙厑璁告竻鐞?`鑰楁椂娴嬮噺-*`/`fresh-*`/`perf-*`/`娴忚鍣ㄤ笂浼犺€楁椂.bin` 绫诲懡鍚?23. **澶ф枃浠跺す涓婁紶瀹炴祴涓庝紭鍖?v1.0.12锛?1k 鏂囦欢/1.37GB 瀹炴祴椹卞姩锛?*锛?   - 瀹炴祴锛歚E:\python\Projectpython_N\history_lottery`锛?1380 鏂囦欢/3195 鐩綍/1.37GB锛屽惈 711MB 澶ф枃浠讹級
-   - 鐡堕瀹氫綅锛堟祻瑙堝櫒璇锋眰绾?+ 椤靛唴 fetch 瀵圭収锛夛細涓婁紶璇锋眰鏈韩蹇紙椤靛唴 fetch 27.9 鏂囦欢/s銆?     node 17.5/s锛夛紝鎱㈠湪 鈶?鐩綍閫愮粍涓茶 mkdir 鈶?鏂囦欢澶逛竴娆℃€?addFiles 鍙惎鍔?1 骞跺彂
-     鈶?涓婁紶闃熷垪鍏ㄩ噺娓叉煋 + 姣忎换鍔＄姸鎬佸彉鍖栬Е鍙?O(n) React 閲嶆覆鏌擄紙**涓诲洜**锛?1k 浠诲姟鏃?     涓荤嚎绋嬭娓叉煋楗ラタ锛?00 鏂囦欢 136s 鍙畬鎴?26 涓級鈶?zustand 鏁扮粍 map O(n) 鏇存柊
-   - 淇锛氱洰褰?*鎸夋繁搴﹀垎灞傚苟琛?mkdir**锛堥檺娴?12锛夛紱addFiles **寰幆濉弧骞跺彂妲?*锛堝皬鏂囦欢 6/澶ф枃浠?2锛夛紱
-     闃熷垪**娓叉煋瑁佸壀**锛堜粎 200 鏉★級+ **1s 杞蹇収**锛堟牴娌伙細500 鏂囦欢 41s 鍏ㄥ畬鎴愶紝~12 鏂囦欢/s锛夛紱
-     tasks 鏀?**Map 瀛樺偍 O(1) 鏇存柊** + FIFO 璋冨害 + 骞跺彂涓婇檺缂撳瓨
-   - 鏈€缁堝疄娴嬶細500 鏂囦欢 41s锛?2/s锛夛紱**21380 鏂囦欢鍏ㄩ噺瀹炴祴瀹屾垚锛?1363 钀藉簱锛?9.9%锛夛紝
-     3196 鐩綍 3s 寤洪綈锛? 澶辫触锛屾€昏€楁椂绾?100 鍒嗛挓锛垀4.3 鏂囦欢/s 绋冲畾锛?*锛?     17 涓湭钀藉簱涓?3 灏忔椂 token 杩囨湡鍓嶅熬娈典腑鏂紙鍓嶇鏃犺法浼氳瘽鏂偣缁紶锛?   - 宸茬煡杈圭晫锛氬埛鏂伴〉闈?闀夸細璇?token 杩囨湡浼氫腑鏂墠绔┍鍔ㄧ殑涓婁紶锛堝悗缁彲鍋氭湇鍔＄鏂偣缁紶锛?24. **Token 杩囨湡娌荤悊 v1.0.13锛?1k 瀹炴祴 17 鏂囦欢闈欓粯涓㈠け 鈫?闆堕潤榛樺け璐ワ級**锛?   - 绗竴杞富鍔ㄧ画鏈燂細`utils/token-refresh.ts` 瑙ｇ爜 JWT exp + 60s 瀹氭椂鍣紙鈮?0min 闃堝€间富鍔ㄥ埛鏂帮紝
-     瑕嗙洊 30 鍒嗛挓 access_token 鏈夋晥鏈燂級+ 骞跺彂閿?+ 5s 鍒锋柊瓒呮椂 + 鎸囨暟閫€閬匡紙1s/2s/4s/8s 闃?429锛?     + 60s 鏈€灏忛棿闅旓紙401 绾犻敊 force 鏃犺闂撮殧锛夛紱`hooks/useVisibilityCheck.ts` 鍒囧墠鍙版娴?   - 绗簩杞?401 绾犻敊锛歚api/client.ts` 鍒锋柊澶辫触涓嶈烦鐧诲綍锛屾敼**鏆傚仠闃熷垪**锛沗store/upload.ts`
-     鐘舵€佹満鍔?`auth-failed`锛坧auseForAuth/resumeAuth锛屾仮澶嶄笉閲嶇疆宸蹭紶杩涘害锛夛紱
-     `components/UploadResumeButton.tsx` 鎭㈠鍏ュ彛锛汱oginPage 鐧诲綍鍚庤嚜鍔ㄦ仮澶嶏紱
-     `utils/metrics.ts` 鍩嬬偣 interrupt_reason
-   - E2E `e2e/_token-e2e.mjs`锛歍C-01 鍒锋柊閲嶈瘯 / TC-02 鏆傚仠鐘舵€佹満 / TC-03 鎭㈠ / TC-05 429 閫€閬?鍏ㄧ豢
-   - 绗笁杞柇鐐圭画浼狅紙IndexedDB + 鏈嶅姟绔垎鐗囨煡璇級涓?v1.1.x 瑙勫垝锛屾湭瀹炴柦
-25. **瀹屾暣鏂偣缁紶 v1.1.0锛堢涓夎疆钀藉湴锛?*锛?   - IndexedDB 鎸佷箙鍖栵紙`utils/resume-store.ts`锛夛細sessionId/partsEtag + 灏忔枃浠?File 寮曠敤
-   - 鏈嶅姟绔垎鐗囩櫥璁帮細`POST /upload/parts-report` + `GET /upload/parts`
-     锛坲pload_sessions.uploaded_parts 鍒楁縺娲伙級
-   - 鑷姩鎭㈠锛坄hooks/useAutoResume.ts`锛夛細鍒锋柊鍚庡皬鏂囦欢鑷姩鍏ラ槦缁紶锛涘ぇ鏂囦欢閲嶉€夌画浼?   - 瀹炴祴锛?0MB 鍒嗙墖涓柇 鈫?璁板綍淇濈暀 鈫?閲嶉€夌画浼犲畬鎴愶紱鏈嶅姟绔?uploaded_parts {1,2} 鉁?   - 娴嬭瘯鑴氭湰锛歚e2e/_resume-e2e.mjs`銆乣e2e/_resume-real.mjs`
-   - **v1.1.1 瀹℃煡鍔犲浐**锛欼ndexedDB 涓嶅彲鐢ㄩ檷绾?localStorage锛圫afari 绉佹湁妯″紡锛夛紱鎵归噺鍐欏悎骞?     锛?00ms锛岄槻楂橀浜嬪姟锛夛紱鏈嶅姟绔笂鎶ユ敼澧為噺锛堥槻鏁扮粍鑶ㄨ儉锛夛紱鎭㈠鍒嗘壒锛堥槻鏋佺闃诲锛夛紱
-     鏈嶅姟绔竻鐞嗗懆鏈熺‘璁ゆ瘡鏃?02:30
-   - **v1.1.2 婕忎紶鏍规不**锛?1k 涓婁紶 9 鏂囦欢婕忎紶锛坅nyio 瀛愭爲锛夊畾浣嶄负 **pump FIFO 闄堟棫蹇収绔炴€?*
-     锛堜换鍔¤璺宠繃浠庢湭鎵ц锛屾棤 init 璁板綍锛泇1.0.12 鍚屾牱婕?17 涓級銆傛案涔呬慨姝ｏ細
-     鈶?pump 鍐呭眰寰幆姣忔閲嶆柊 getState 鈶?`verifyAndBackfill` 涓婁紶瀹屾垚鏍￠獙+鑷姩琛ヤ紶銆?     楠岃瘉锛歛nyio 閲嶄紶 87 鏂囦欢 100%銆佹ā鎷熷垹闄も啋鑷姩琛ヤ紶銆?1k 瀵规瘮 0 婕忎紶 0 澶氫綑
-   - **v1.1.3 鍥炴敹绔欐竻绌烘暟鎹涪澶憋細鏍瑰洜 + 鍏ㄩ噺鎭㈠ + purge 闃插尽鍔犲浐 + 娓呯┖鎬ц兘浼樺寲**锛?5:35 鐢ㄦ埛缃戦〉鍏ㄩ€?     鍒犻櫎 62 鐩爣锛?2799 椤瑰惈 21k 涓婁紶锛夆啋 娓呯┖鍥炴敹绔?鈫?files/directories 鍏ㄦ竻绌恒€?     鎭㈠锛歁inIO 鐗堟湰鎺у埗淇濈暀鍘嗗彶 PUT 鏁版嵁 鈫?鎾ら攢 19879 涓垹闄ゆ爣璁?鈫?瀵硅薄鍏ㄦ仮澶嶏紱
-     audit_logs 閲嶅缓鐩綍鏍戯紙39519锛? 鏂囦欢锛?0955锛?3.7GB锛夆啋 鎶芥煡涓嬭浇瀛楄妭涓€鑷淬€?     淇锛歚purgeItems` 鐩綍/鏂囦欢鍒嗘敮琛?`is_deleted` 鏍￠獙锛堟椿璺冪洰鏍?purge 杩斿洖 count=0 鎷掔粷锛夈€?     鎬ц兘锛歚listTrash` 鍒嗛〉 + total锛涙柊澧?`POST /api/files/trash/empty` 娓呯┖鍥炴敹绔欎笓鐢ㄦ帴鍙?     锛堟湇鍔＄鎵归噺鍒犲璞?removeObjects + 鎵归噺鍒犺 ANY 鏁扮粍 + 鑱氬悎 quota锛夛紱鍓嶇銆屾竻绌哄洖鏀剁珯銆嶆寜閽€?     瀹炴祴娓呯┖ 1200 椤?7.7s锛堟鍓?844 鎵?脳 2s 鈮?28 鍒嗛挓锛夈€傜敤鎴风‘璁ゅ垹闄ゆ仮澶嶆暟鎹苟娓呯┖锛?     瀛ゅ効娈嬬暀涓€骞舵竻鐞?鈫?骞插噣鐘舵€侊紙2 鏍圭洰褰曘€? 鏂囦欢銆佸洖鏀剁珯 0锛夛紱鍘婚噸姹?4523 鏉?+ MinIO
-     姹犲璞?21629 涓寜鐢ㄦ埛鎸囦护鍏ㄩ儴鍒犻櫎锛堝悗缁笂浼犻噸鏂版敞鍐屾睜锛夈€?     鎭㈠宸ュ叿锛歚e2e/_recover-*.mjs`锛汳inIO 鏁版嵁鍗峰浠斤細`N:\minio-data-backup-20260826`
-   - 娴嬭瘯鑴氭湰锛歚e2e/_big-folder-upload.mjs`锛?1k 鍏ㄩ噺锛夈€乣_perf500.mjs`銆乣_inpage-fetch.mjs`銆?     `_server-throughput.mjs`銆乣_folder-conc.mjs`銆乣_single-timing.mjs`
-   - **v1.1.4 浜у搧鍖?*锛氬敭鍓?浜や粯/婕旂ず鏂囨。锛坉ocs/08-10锛? README 浜у搧棣栭〉 + 涓€閿紨绀鸿剼鏈?   - **v1.1.5 涓婁紶浣撻獙淇锛堢敤鎴峰弽棣堬級**锛氬伓鍙戙€岃姹傚け璐ワ紝璇风◢鍚庨噸璇曘€嶁啋 鐬椂鏁呴殰鑷剤锛?     鏆傚仠/缁х画锛堝崟浠诲姟 + 鍏ㄩ€夋壒閲?+ 鍏ㄩ儴鏆傚仠/涓€閿叏閮ㄧ户缁級锛涗笂浼犻潰鏉挎敼涓轰笉閬尅椤甸潰鐨勬偓娴崱鐗囥€?     璇﹁ `CHANGELOG.md` v1.1.5 涓?`docs/upload-architecture.md` 绗?5 鑺傘€?     楠岃瘉锛歚node --import ./e2e/ts-register.mjs e2e/_upload-resilience.ts` 鈫?25/25 閫氳繃
-     锛堝彈闄愮幆澧冩棤娉曡窇 esbuild/tsx 涓?Docker锛屾晠鐢?Node 鍘熺敓 TS 鍓ョ + 浼€?XHR/fetch 鍋氶€昏緫楠岃瘉锛?     椤哄甫淇 3 涓殣鎬х己闄凤細杩熷埌杩涘害瑕嗙洊宸茬粨绠楃姸鎬侊紙杩愯浠ょ墝锛夈€佽繜鍒板洖璋冨娲绘浼氳瘽锛坮ecordWrites锛夈€?     鏆傚仠鍚庣珛鍒荤户缁涓嶅埌鏂偣锛坒lushResumeWrites锛?   - **v1.1.6/v1.1.7 涓婁紶浠诲姟鍒楄〃甯搁┗**锛氫笉鍐嶈嚜鍔ㄩ殣钘?+ 椤舵爮鍥哄畾鍏ュ彛锛涙闈㈢鏀逛负**鍙充晶鍗犱綅甯搁┗鏍?*
-     锛堜笉瑕嗙洊鏂囦欢鍒楄〃锛屽彲鏀惰捣涓?48px 缁嗘爮锛夛紝绉诲姩绔繚鎸佸簳閮ㄩ潰鏉?   - **v1.1.8 涓婁紶鍙潬鎬ф牴鍥犱慨澶嶏紙鐪熷疄娴忚鍣ㄥ鐜?+ 鏈嶅姟绔棩蹇楀畾浣嶏級**锛?     鈶?**骞跺彂鍝堝笇涓插彿锛圥0锛?*锛氬鎴风 BLAKE3 worker 姹犵敤銆屽垎鐗囧簭鍙枫€嶅綋璇锋眰 ID锛屽鏂囦欢骞跺彂鍝堝笇鏃?        浜掔浉 resolve 鈫?涓婃姤閿欒鍝堝笇 鈫?鏈嶅姟绔?400銆屾枃浠跺搱甯屾牎楠屽け璐ャ€嶁啋 鐣岄潰銆岃姹傚け璐ワ紝鐐归噸璇曞張鑳芥垚鍔熴€?        锛堚墹8MB 璧颁富绾跨▼鍘熷瓙鍝堝笇锛屾晠鍙湪澶ф枃浠跺嚭鐜帮級銆備慨澶嶏細璇锋眰 ID 鍏ㄥ眬鍞竴銆?     鈶?**鏆傚仠鍚庛€屽叏閮ㄧ户缁€嶅崱姝?*锛氭殏鍋滄湭涓柇 JSON 鎺ュ彛 鈫?鏈嶅姟绔凡瀹屾垚钀藉簱銆佸鎴风涓㈠純缁撴灉 鈫?        鍐嶆 complete 鎾?MinIO NoSuchUpload(500) 鈫?姘镐箙銆屼笂浼犱腑銆嶃€備慨澶嶄笁灞傦細
-        鎺ュ彛 AbortSignal + 鏈嶅姟绔?complete 骞傜瓑鑷剤 + 瀹㈡埛绔?init 鏍￠獙鑷剤 + store 鍏堝垽鎴愬姛銆?     鈶?甯搁┗鏍忓搴﹁嚜閫傚簲锛?00px 绐楀彛鏂囦欢鍒楄〃 256px 鈫?356px锛?     娴嬭瘯濂椾欢锛堢湡瀹炴祻瑙堝櫒 Playwright + 鏈満 Edge锛岄渶 danger-full-access 鎵嶈兘 spawn 娴忚鍣級锛?     `_ui-hash-check.mjs`锛堝苟鍙戝搱甯?vs 涓茶鍩哄噯锛夈€乣_ui-upload-flow.mjs`锛? 鍦烘櫙锛屾姄鍏ㄩ儴 4xx/5xx锛夈€?     `_ui-dock-check.mjs`锛堝竷灞€鍑犱綍+鍛戒腑娴嬭瘯+4 绉嶇獥鍙ｅ搴︼級銆乣_cleanup-tests.mjs`锛堣蒋鍒犫啋purge 娓呯悊娴嬭瘯鏁版嵁锛?     杩愯鍓嶅厛 `docker compose up -d`锛岃剼鏈緷璧?`127.0.0.1:8080` 涓?`.env` 涓殑 admin 鍑嵁
-   - **v1.1.9/v1.1.10/v1.1.11 浜や簰涓庢暟鎹潰淇**锛氬彇娑?Esc 鏀惰捣銆佹敹璧锋€佹敼甯︽枃瀛楃揣鍑戦潰鏉匡紱
-     浠诲姟鍒楄〃榛樿**鎮诞娴眰**锛堟案涓嶆秷澶憋紝鏀寔涓婁紶+涓嬭浇浠诲姟銆佸埛鏂板悗浠嶅湪 localStorage 杩樺師锛夛紱
-     涓婁紶鐩爣鐩綍琚垹鏃?*绔嬪嵆澶辫触涓嶉噸璇?*骞舵寜鐩綍鏁存壒娓呯悊锛堝疄娴嬫妸 291 娆?404 椋庢毚闄嶅埌 14锛?   - **v1.1.12 鍔熻兘浣撴濂椾欢**锛歚e2e/_ui-smoke.mjs` 绔埌绔窇鏍稿績鍔熻兘锛堢櫥褰?寤虹洰褰?涓婁紶/棰勮/
-     閲嶅懡鍚?鎼滅储/鍒嗕韩/涓嬭浇鏂囦欢+鏂囦欢澶?鍒犻櫎鈫掑洖鏀剁珯鈫掓仮澶?鍚勯〉闈笌鎺ュ彛锛夛紝**33/33 閫氳繃**锛?     浣撴涓彂鐜板苟淇锛氫换鍔￠潰鏉?z-index(1200) 楂樹簬 antd 寮瑰眰(1050) 鈫?鐩栦綇琛屽唴銆屾洿澶氥€嶄笅鎷夎彍鍗曪紝
-     瀵艰嚧閲嶅懡鍚?鍒嗕韩/涓嬭浇/鍒犻櫎绛夎鍐呮搷浣滃け鏁堬紙鐜板凡闄嶄负 900锛?     鍏ㄩ儴濂椾欢锛歚_ui-smoke` 33/33 路 `_upload-resilience` 30/30 路 `_ui-hash-check` 路
-     `_ui-float-download` 路 `_ui-dir-gone` 路 `_ui-upload-flow` 路 `_ui-dock-check` 鍧囬€氳繃
-     娉ㄦ剰锛氬悗鍙颁换鍔′笉缁ф壙鎻愭潈锛岃窇 Playwright 濂椾欢闇€鍓嶅彴 + danger-full-access
+     | health（DB+MinIO 探测） | 577 RPS / P95 1.16s | 665 RPS / P95 1.02s | 外部依赖序列化，提升有限 |
+     | 静态资源（nginx gzip） | 6774 RPS / P95 141ms | — | 最强，与 server 无关 |
+     | 登录态列目录（JWT+DB+Redis） | 255 RPS / P95 3.78s | **351 RPS / P95 2.19s** | +38% / -42% |
+     全部 0 失败（500 并发下无错误响应）
+   - 瓶颈定位：docker stats 实测 server CPU 单进程 ~120%（单核饱和）、PG/Redis 低负载
+     → **cluster 多进程**（`index.ts`：主进程引导 + scheduler 单实例 + 4 worker 共享端口，
+     worker 崩溃自动拉起；`PG_POOL_MAX` 每 worker 均分；`WEB_CONCURRENCY` 可配，1 = 关闭）
+   - cluster 后 worker CPU ~295%（3/4 核满）——瓶颈已到 4 核 VM CPU 上限；
+     更高吞吐需更多核或减少每请求 CPU（JWT 验证 + JSON 序列化）
+   - 回归：登录/列目录/上传/下载/删除全部通过；scheduler 仅主进程执行（无重复任务）
+18. **忘记密码（邮箱 / 短信找回）**：
+   - 后端 `password-reset.service.ts`：仅本地账号（LDAP 由域内管理）；6 位验证码 10 分钟有效、
+     最多 5 次尝试、每账号 1 小时 5 次发送 + 60s 冷却、IP 限流；统一模糊响应（不泄露账号
+     是否存在）；重置后吊销全部会话
+   - 通道：邮箱（SMTP，RESET_MAIL_*）+ 短信（自建网关 webhook，RESET_SMS_WEBHOOK POST
+     {phone, code}）；未配置通道时前端提示"联系管理员"
+   - 表 `password_reset_codes`（索引 + 每日清理保留 7 天）；审计 `password_reset`
+   - 前端：`/forgot-password` 独立页（三步：账号+通道 -> 验证码+新密码 -> 完成），登录页
+     "忘记密码？"入口；通道可用性由 `/api/auth/password-reset/channels` 驱动
+   - 实测端到端（本地 SMTP 接收器）：发码 -> 邮件收到 6 位码（base64 正文解码）-> 错误码 400 ->
+     正确码重置 -> 新密码登录成功 -> 验证码一次性（复用 400）-> 原密码失效；admin 密码已恢复
+   - 生产配置：.env 填 `RESET_MAIL_HOST/PORT/SECURE/USER/PASS/FROM`（或 `RESET_SMS_WEBHOOK`）后
+     重建 server 即生效；用户需在管理台维护 email/phone 字段
+19. **注册/登录安全增强（核心 8 项，端到端实测 41 项全绿）**：
+   - **自助注册** `/register`：邮箱/手机验证码（`verification_codes` 表，限流 1h5 次+60s 冷却、
+     一次性、5 次尝试）+ 算术 CAPTCHA（**Redis 存储**——cluster 多 worker 共享，进程内存会跨
+     worker 失效）+ 密码强度（≥8 位含字母数字）+ 用户协议必选；重复注册/未同意协议被拒
+   - **多方式登录**：账号/邮箱/手机号（`username OR email OR phone`）；LDAP 走域认证
+   - **账号锁定**：连续 5 次失败锁定 30 分钟（`failed_attempts/locked_until`），到期自动解锁
+   - **2FA（TOTP）**：speakeasy + qrcode（新依赖）；设置扫码绑定 → 登录密码后发挑战令牌
+     （5 分钟 JWT）→ 校验动态码完成登录（`finishAuth` 需跳过 2FA 分支否则二次返回挑战——已修）；
+     关闭需动态码+密码；`window:1` 容忍时钟偏差
+   - **密码找回升级**：验证码 + **重置链接**（一次性、30 分钟、`reset-password?token=` 页）；
+     重置后吊销全部会话强制重新登录
+   - **密码历史**：`password_history` 表保留最近 5 条，改密/重置禁重复使用
+   - **设备管理**：`/api/auth/sessions` 列表（含当前标记）+ 踢下线（吊销会话）
+   - **异常登录检测**：登录时对比最近会话 IP/UA 变化 → `risk` 标记 + 前端提示
+     （无 IP 地理库，用设备特征近似；异地地理库/数据导出/90 天强制改密后置）
+   - 实测：安全测试 1（注册/多方式/锁定/设备）14 项、安全测试 2（2FA/重置链接/历史）16 项、
+     前端渲染 11 项，全部通过
+20. **批量操作分批修复（回收站全选一次性彻底删除）**：
+   - 根因：批量接口 `targets` 单次上限 100（后端防滥用），回收站 >100 项全选一次性提交被 zod
+     拒绝（400）→ 只能单个删除
+   - 修复：前端**分批串行**（每批 ≤100）——`TrashPage` 恢复/彻底删除、`FileBrowserPage`
+     删除/移动/复制（`chunked`/`chunkedTargets`）；批量 `onOk` 补 try/catch（失败提示 + 刷新
+     列表，防确认弹窗卡死无反馈）
+   - 实测（浏览器 e2e `e2e/_trash-batch-full.mjs`）：API 造 105 目录（>100）→ 文件页全选
+     105 行 → Popconfirm+Modal 两级确认显示 105 → 分批删除 → 回收站 105 项 → 全选彻底删除
+     （确认弹窗 105 项）→ 分批 purge → 清空，全程无控制台错误
+21. **体验优化 v1.0.10（代码审查 32 项 + 浏览器实测整改）**：详见 CHANGELOG v1.0.10。
+    - 核心：api 层统一 30s 超时 + 网络错误中文归一化（根因）；密码强度前端与后端完全一致
+      （`web/src/utils/password.ts` 复用 4 处）；上传/新建按写权限禁用；批量删除单次确认；
+      上传完成汇总通知；MoveModal/版本回滚/权限删除防重与容错
+    - 分享页：目录分享面包屑（后端返回子树内祖先链，可点击返回上级）+ 目录内文件可下载
+      （downloadShare 支持 fileId）+ 网络错误与"分享不存在"区分
+    - 安全操作确认：关闭 2FA / 下线设备二次确认；注册页验证码 60s 倒计时、CAPTCHA 失败重试、
+      协议链接 stopPropagation
+    - 实测：`e2e/_ux-assert.mjs`（28 项）+ `e2e/_share-ux.mjs`（10 项）全绿
+22. **上传性能优化 v1.0.11（用户实测 6 文件 2.4s/个 → 请求级剖析驱动）**：
+   - 根因：上传请求本身仅 100-300ms/文件；浪费在 ① 前端每任务完成都刷新列表
+     （6 文件 → 6 次 GET 对，~1.8s）② BLAKE3 WASM 首次加载（~100ms+）③ completeUpload
+     重复 statObject（2 次 MinIO 往返）
+   - 修复：上传完成刷新**防抖合并**（500ms 窗口一次）；`warmupHash()` 页面加载后预热 WASM；
+     completeUpload 合并两次 statObject 为一次
+   - 实测（6×2KB 全新内容）：请求阶段 ~1.3s 全部完成 + 列表刷新仅 1 次（原 6 次）；
+     秒传场景 init <500ms
+   - 注意：用户已上传真实数据（约 950 活跃文件，Python 项目目录树），**勿清理**；
+     测试残留只允许清理 `耗时测量-*`/`fresh-*`/`perf-*`/`浏览器上传耗时.bin` 类命名
+23. **大文件夹上传实测与优化 v1.0.12（21k 文件/1.37GB 实测驱动）**：
+   - 实测：`E:\python\Projectpython_N\history_lottery`（21380 文件/3195 目录/1.37GB，含 711MB 大文件）
+   - 瓶颈定位（浏览器请求级 + 页内 fetch 对照）：上传请求本身快（页内 fetch 27.9 文件/s、
+     node 17.5/s），慢在 ① 目录逐组串行 mkdir ② 文件夹一次性 addFiles 只启动 1 并发
+     ③ 上传队列全量渲染 + 每任务状态变化触发 O(n) React 重渲染（**主因**：21k 任务时
+     主线程被渲染饥饿，500 文件 136s 只完成 26 个）④ zustand 数组 map O(n) 更新
+   - 修复：目录**按深度分层并行 mkdir**（限流 12）；addFiles **循环填满并发槽**（小文件 6/大文件 2）；
+     队列**渲染裁剪**（仅 200 条）+ **1s 轮询快照**（根治：500 文件 41s 全完成，~12 文件/s）；
+     tasks 改 **Map 存储 O(1) 更新** + FIFO 调度 + 并发上限缓存
+   - 最终实测：500 文件 41s（12/s）；**21380 文件全量实测完成：21363 落库（99.9%），
+     3196 目录 3s 建齐，0 失败，总耗时约 100 分钟（~4.3 文件/s 稳定）**；
+     17 个未落库为 3 小时 token 过期前尾段中断（前端无跨会话断点续传）
+   - 已知边界：刷新页面/长会话 token 过期会中断前端驱动的上传（后续可做服务端断点续传）
+24. **Token 过期治理 v1.0.13（21k 实测 17 文件静默丢失 → 零静默失败）**：
+   - 第一轮主动续期：`utils/token-refresh.ts` 解码 JWT exp + 60s 定时器（≤10min 阈值主动刷新，
+     覆盖 30 分钟 access_token 有效期）+ 并发锁 + 5s 刷新超时 + 指数退避（1s/2s/4s/8s 防 429）
+     + 60s 最小间隔（401 纠错 force 无视间隔）；`hooks/useVisibilityCheck.ts` 切前台检测
+   - 第二轮 401 纠错：`api/client.ts` 刷新失败不跳登录，改**暂停队列**；`store/upload.ts`
+     状态机加 `auth-failed`（pauseForAuth/resumeAuth，恢复不重置已传进度）；
+     `components/UploadResumeButton.tsx` 恢复入口；LoginPage 登录后自动恢复；
+     `utils/metrics.ts` 埋点 interrupt_reason
+   - E2E `e2e/_token-e2e.mjs`：TC-01 刷新重试 / TC-02 暂停状态机 / TC-03 恢复 / TC-05 429 退避 全绿
+   - 第三轮断点续传（IndexedDB + 服务端分片查询）为 v1.1.x 规划，未实施
+25. **完整断点续传 v1.1.0（第三轮落地）**：
+   - IndexedDB 持久化（`utils/resume-store.ts`）：sessionId/partsEtag + 小文件 File 引用
+   - 服务端分片登记：`POST /upload/parts-report` + `GET /upload/parts`
+     （upload_sessions.uploaded_parts 列激活）
+   - 自动恢复（`hooks/useAutoResume.ts`）：刷新后小文件自动入队续传；大文件重选续传
+   - 实测：20MB 分片中断 → 记录保留 → 重选续传完成；服务端 uploaded_parts {1,2} ✅
+   - 测试脚本：`e2e/_resume-e2e.mjs`、`e2e/_resume-real.mjs`
+   - **v1.1.1 审查加固**：IndexedDB 不可用降级 localStorage（Safari 私有模式）；批量写合并
+     （500ms，防高频事务）；服务端上报改增量（防数组膨胀）；恢复分批（防极端阻塞）；
+     服务端清理周期确认每日 02:30
+   - **v1.1.2 漏传根治**：21k 上传 9 文件漏传（anyio 子树）定位为 **pump FIFO 陈旧快照竞态**
+     （任务被跳过从未执行，无 init 记录；v1.0.12 同样漏 17 个）。永久修正：
+     ① pump 内层循环每次重新 getState ② `verifyAndBackfill` 上传完成校验+自动补传。
+     验证：anyio 重传 87 文件 100%、模拟删除→自动补传、21k 对比 0 漏传 0 多余
+   - **v1.1.3 回收站清空数据丢失：根因 + 全量恢复 + purge 防御加固 + 清空性能优化**：15:35 用户网页全选
+     删除 62 目标（42799 项含 21k 上传）→ 清空回收站 → files/directories 全清空。
+     恢复：MinIO 版本控制保留历史 PUT 数据 → 撤销 19879 个删除标记 → 对象全恢复；
+     audit_logs 重建目录树（39519）+ 文件（70955，83.7GB）→ 抽查下载字节一致。
+     修复：`purgeItems` 目录/文件分支补 `is_deleted` 校验（活跃目标 purge 返回 count=0 拒绝）。
+     性能：`listTrash` 分页 + total；新增 `POST /api/files/trash/empty` 清空回收站专用接口
+     （服务端批量删对象 removeObjects + 批量删行 ANY 数组 + 聚合 quota）；前端「清空回收站」按钮。
+     实测清空 1200 项 7.7s（此前 844 批 × 2s ≈ 28 分钟）。用户确认删除恢复数据并清空，
+     孤儿残留一并清理 → 干净状态（2 根目录、0 文件、回收站 0）；去重池 4523 条 + MinIO
+     池对象 21629 个按用户指令全部删除（后续上传重新注册池）。
+     恢复工具：`e2e/_recover-*.mjs`；MinIO 数据卷备份：`N:\minio-data-backup-20260826`
+   - 测试脚本：`e2e/_big-folder-upload.mjs`（21k 全量）、`_perf500.mjs`、`_inpage-fetch.mjs`、
+     `_server-throughput.mjs`、`_folder-conc.mjs`、`_single-timing.mjs`
+   - **v1.1.4 产品化**：售前/交付/演示文档（docs/08-10）+ README 产品首页 + 一键演示脚本
+   - **v1.1.5 上传体验修复（用户反馈）**：偶发「请求失败，请稍后重试」→ 瞬时故障自愈；
+     暂停/继续（单任务 + 全选批量 + 全部暂停/一键全部继续）；上传面板改为不遮挡页面的悬浮卡片。
+     详见 `CHANGELOG.md` v1.1.5 与 `docs/upload-architecture.md` 第 5 节。
+     验证：`node --import ./e2e/ts-register.mjs e2e/_upload-resilience.ts` → 25/25 通过
+     （受限环境无法跑 esbuild/tsx 与 Docker，故用 Node 原生 TS 剥离 + 伪造 XHR/fetch 做逻辑验证）
+     顺带修复 3 个隐性缺陷：迟到进度覆盖已结算状态（运行令牌）、迟到回调复活死会话（recordWrites）、
+     暂停后立刻继续读不到断点（flushResumeWrites）
+   - **v1.1.6/v1.1.7 上传任务列表常驻**：不再自动隐藏 + 顶栏固定入口；桌面端改为**右侧占位常驻栏**
+     （不覆盖文件列表，可收起为 48px 细栏），移动端保持底部面板
+   - **v1.1.8 上传可靠性根因修复（真实浏览器复现 + 服务端日志定位）**：
+     ① **并发哈希串号（P0）**：客户端 BLAKE3 worker 池用「分片序号」当请求 ID，多文件并发哈希时
+        互相 resolve → 上报错误哈希 → 服务端 400「文件哈希校验失败」→ 界面「请求失败，点重试又能成功」
+        （≤8MB 走主线程原子哈希，故只在大文件出现）。修复：请求 ID 全局唯一。
+     ② **暂停后「全部继续」卡死**：暂停未中断 JSON 接口 → 服务端已完成落库、客户端丢弃结果 →
+        再次 complete 撞 MinIO NoSuchUpload(500) → 永久「上传中」。修复三层：
+        接口 AbortSignal + 服务端 complete 幂等自愈 + 客户端 init 校验自愈 + store 先判成功。
+     ③ 常驻栏宽度自适应（900px 窗口文件列表 256px → 356px）
+     测试套件（真实浏览器 Playwright + 本机 Edge，需 danger-full-access 才能 spawn 浏览器）：
+     `_ui-hash-check.mjs`（并发哈希 vs 串行基准）、`_ui-upload-flow.mjs`（4 场景，抓全部 4xx/5xx）、
+     `_ui-dock-check.mjs`（布局几何+命中测试+4 种窗口宽度）、`_cleanup-tests.mjs`（软删→purge 清理测试数据）
+     运行前先 `docker compose up -d`，脚本依赖 `127.0.0.1:8080` 与 `.env` 中的 admin 凭据
+   - **v1.1.9/v1.1.10/v1.1.11 交互与数据面修复**：取消 Esc 收起、收起态改带文字紧凑面板；
+     任务列表默认**悬浮浮层**（永不消失，支持上传+下载任务、刷新后仍在 localStorage 还原）；
+     上传目标目录被删时**立即失败不重试**并按目录整批清理（实测把 291 次 404 风暴降到 14）
+   - **v1.1.12 功能体检套件**：`e2e/_ui-smoke.mjs` 端到端跑核心功能（登录/建目录/上传/预览/
+     重命名/搜索/分享/下载文件+文件夹/删除→回收站→恢复/各页面与接口），**33/33 通过**；
+     体检中发现并修复：任务面板 z-index(1200) 高于 antd 弹层(1050) → 盖住行内「更多」下拉菜单，
+     导致重命名/分享/下载/删除等行内操作失效（现已降为 900）
+     全部套件：`_ui-smoke` 33/33 · `_upload-resilience` 30/30 · `_ui-hash-check` ·
+     `_ui-float-download` · `_ui-dir-gone` · `_ui-upload-flow` · `_ui-dock-check` 均通过
+     注意：后台任务不继承提权，跑 Playwright 套件需前台 + danger-full-access
 
-## 5. 瀹炴祴鍩虹嚎锛?026-08-24锛?
-| 鎸囨爣 | 鏁板€?|
+## 5. 实测基线（2026-08-24）
+
+| 指标 | 数值 |
 |---|---|
-| 涓婁紶锛?12MB multipart 8 骞跺彂锛屽崟鐩橈級 | 33.6 MB/s |
-| 600MB 棣栦紶 / 姹犳敞鍐?| 16.3s / 51.9s |
-| 瀹瑰櫒鍐呬笅杞斤紙绌洪棽鍗曟祦 / 骞跺彂 / 浜夌敤鏈燂級 | 156 / 232-288 / 193 MB/s |
-| 瀹夸富涓嬭浇锛圖ocker 绔彛杞彂闄愬埗锛?| 38.6-54.8 MB/s |
-| computeObjectHash锛?00MB锛屽苟鍙?6 璺級 | 129 MB/s锛堝師 104锛?|
-| 绉掍紶锛堝垹闄ゅ悗閲嶄紶 / 缂撳瓨鍛戒腑锛?| 46ms / 44ms |
-| 520 鏂囦欢娴忚鍣ㄤ笂浼?| 鏂板鎭?520/520锛岄槦鍒?0 澶辫触锛垀700s锛?|
-| BLAKE3 10GB 骞惰鍝堝笇 | 16.5s锛?20 MB/s锛?|
-| Redis 鐩綍鍒楄〃缂撳瓨 | 瀹炴祴 3 杩炶 = 1 miss + 2 hit锛坘eyspace_hits 澧為噺楠岃瘉锛夛紝TTL 30s 鐢熸晥 |
-| Redis 鍒嗕韩 meta 缂撳瓨 | 浜屾璁块棶鍛戒腑锛況evoke 鍚庣珛鍗冲け鏁堬紙smoke-redis-cache 15/15 鍏ㄧ豢锛?|
-| 閰嶉閲嶇畻锛?0 涓囪 files锛宱wner 鑱氬悎 SUM锛?| 鍏ㄨ〃鎵?26.7ms / 3226 buffers 鈫?Index Only Scan 0.30ms / 9 buffers锛垀88x锛?|
-| files 鐩綍鍒楄〃锛?0 琛?鐩綍锛?| idx_files_dir 0.356ms 鈫?uq_files_dir_name 0.185ms锛堝厤鍐椾綑绱㈠紩锛?|
-| 鐩綍鍒楄〃锛? 涓囪鐩綍琛ㄣ€?500 瀛愮洰褰曪級 | idx_directories_parent + Sort 1.75ms锛圫ort 寮€閿€鍙拷鐣ワ紝鏈彟寤虹储寮曪級 |
-| 璺緞鍓嶇紑鏌ヨ锛? 涓囪鐩綍锛?| idx_directories_path_pattern Bitmap 0.91ms锛汫IN trgm 2.15ms锛堝墠缂€ btree 鏇翠紭锛屾湭寤?GIN锛?|
+| 上传（512MB multipart 8 并发，单盘） | 33.6 MB/s |
+| 600MB 首传 / 池注册 | 16.3s / 51.9s |
+| 容器内下载（空闲单流 / 并发 / 争用期） | 156 / 232-288 / 193 MB/s |
+| 宿主下载（Docker 端口转发限制） | 38.6-54.8 MB/s |
+| computeObjectHash（300MB，并发 6 路） | 129 MB/s（原 104） |
+| 秒传（删除后重传 / 缓存命中） | 46ms / 44ms |
+| 520 文件浏览器上传 | 新增恰 520/520，队列 0 失败（~700s） |
+| BLAKE3 10GB 并行哈希 | 16.5s（620 MB/s） |
+| Redis 目录列表缓存 | 实测 3 连读 = 1 miss + 2 hit（keyspace_hits 增量验证），TTL 30s 生效 |
+| Redis 分享 meta 缓存 | 二次访问命中；revoke 后立即失效（smoke-redis-cache 15/15 全绿） |
+| 配额重算（10 万行 files，owner 聚合 SUM） | 全表扫 26.7ms / 3226 buffers → Index Only Scan 0.30ms / 9 buffers（~88x） |
+| files 目录列表（50 行/目录） | idx_files_dir 0.356ms → uq_files_dir_name 0.185ms（免冗余索引） |
+| 目录列表（5 万行目录表、1500 子目录） | idx_directories_parent + Sort 1.75ms（Sort 开销可忽略，未另建索引） |
+| 路径前缀查询（5 万行目录） | idx_directories_path_pattern Bitmap 0.91ms；GIN trgm 2.15ms（前缀 btree 更优，未建 GIN） |
 
-## 6. 寰呭姙 / 涓嬩竴姝?
-- [x] ~~鍏ㄩ噺 21k 鏂囦欢鐩綍涓婁紶鍥炲綊~~锛坴1.0.12 瀹炴祴瀹屾垚锛?1363 钀藉簱 / 0 澶辫触锛?- [x] ~~v1.1.x 绗笁杞細瀹屾暣鏂偣缁紶~~锛坴1.1.0 宸插疄鏂斤細IndexedDB + 鏈嶅姟绔垎鐗囨煡璇?+ 鑷姩鎭㈠锛?- [ ] 娴忚鍣ㄤ笅杞界粡 Docker 绔彛杞彂浠?38-55 MB/s鈥斺€斿闇€鏇撮珮鍙厤缃?host 缃戠粶/鍘熺敓缃戠粶妯″紡锛堥儴缃插眰锛?- [ ] 娴忚鍣ㄧ鏂囦欢澶规嫋鎷戒笂浼犳祴璇曪紙Playwright 瀵?webkitdirectory 鏀寔鏈夐檺锛屽彲鐢?DataTransfer 妯℃嫙锛?- [ ] 鍛藉悕鍗?vs N: bind 瀵规瘮澶嶆祴锛堟湰鏈鸿蛋 N: bind锛岀函鍛藉悕鍗锋洿蹇級
-- [ ] 鍙€夛細Redis 鐗堟缂撳瓨锛堝綋鍓嶈繘绋嬪唴瀹炵幇锛?- [ ] 鍙€夛細涓嬭浇鏀圭粡鍚庣娴佸紡锛堥渶璇勪及 Docker 绔彛杞彂鏄惁浠嶆槸鐡堕锛?
-## 7. 宸茬煡鍧戯紙寮€鍙戞椂娉ㄦ剰锛?
-- **PowerShell 鍐呰仈 node**锛氬惈姝ｅ垯/寮曞彿杞箟鍑洪敊锛屼竴寰嬪啓鏂囦欢鑴氭湰鍐?`node xxx.mjs`銆?- **瀹瑰櫒鍐呮帰閽?*锛氬鍣ㄤ互 `node` 鐢ㄦ埛杩愯锛?app 鍙锛屾棩蹇楀啓 /tmp锛夛紱鎺㈤拡鎸?unref'd worker 鏃?  await 涓?settle 浼氫互閫€鍑虹爜 13 缁撴潫锛堜簨浠跺惊鐜┖杞級锛屽姞 `setInterval` 淇濇椿銆?- **鐧诲綍闄愭祦**锛? 娆?鍒嗛挓/IP+璐﹀彿锛屾祴璇曡剼鏈覆琛岃窇銆侀棿闅?60s+銆?- **棰勮浜や簰**锛氬崟鍑?*鏂囦欢鍚嶅崟鍏冩牸**瑙﹀彂棰勮锛堣鍙屽嚮浠呯洰褰曟湁鏁堬級锛沀I 涓嬭浇 = window.open 棰勭鍚?URL
-  锛坅ttachment 鍝嶅簲娴忚鍣ㄧ洿鎺ヤ笅杞姐€佷笉瀵艰埅鏂伴〉绛撅級銆?- **nginx 鍔ㄦ€佽В鏋愶紙宸叉牴娌?502锛?*锛歚deploy/nginx/nginx.conf` 鐨?`/api/` location 鐢?  `resolver 127.0.0.11 valid=10s ipv6=off` + `set $backend http://server:3000` + `proxy_pass $backend`
-  鍔ㄦ€佽В鏋?server 鍩熷悕锛圖ocker 鍐呯疆 DNS锛夈€傚疄娴嬪己鍒?server IP 鍙樻洿鍚?**涓嶉噸鍚?web锛屸墹10s 鑷姩鎭㈠**銆?  娉ㄦ剰锛氭敼 nginx.conf 闇€閲嶅缓 web 闀滃儚锛堥厤缃瀯寤烘湡鎷峰叆锛夛紱淇厤缃嬁鍥為€€涓洪潤鎬?`proxy_pass http://server:3000`銆?- **Redis 缂撳瓨閿惈 userId**锛欰CL 鏉冮檺鎽樿鏄寜鐢ㄦ埛瑙ｆ瀽鐨勶紝鍕垮幓鎺?userId 鍏变韩缂撳瓨銆?- **ioredis v6**锛氱敤 `import { Redis } from 'ioredis'`锛堥粯璁ゅ鍑哄湪 NodeNext 涓嬬被鍨嬪紓甯革級銆?- **N: 鐩樻槸鎱㈤€熸暟鎹洏**锛堢洿璇?620MB/s锛夛紝bind mount 杩涗竴姝ラ檷閫熲€斺€旀€ц兘缁撹浠ョ 5 鑺備负鍑嗐€?- **.wslconfig**锛歚memory=6GB processors=4 swap=2GB localhostForwarding=true`锛堝浠?`.wslconfig.bak`锛夈€?
-## 8. 鍏虫満/鎭㈠鍛戒护閫熸煡
+## 6. 待办 / 下一步
+
+- [x] ~~全量 21k 文件目录上传回归~~（v1.0.12 实测完成：21363 落库 / 0 失败）
+- [x] ~~v1.1.x 第三轮：完整断点续传~~（v1.1.0 已实施：IndexedDB + 服务端分片查询 + 自动恢复）
+- [ ] 浏览器下载经 Docker 端口转发仅 38-55 MB/s——如需更高可配置 host 网络/原生网络模式（部署层）
+- [ ] 浏览器端文件夹拖拽上传测试（Playwright 对 webkitdirectory 支持有限，可用 DataTransfer 模拟）
+- [ ] 命名卷 vs N: bind 对比复测（本机走 N: bind，纯命名卷更快）
+- [ ] 可选：Redis 版段缓存（当前进程内实现）
+- [ ] 可选：下载改经后端流式（需评估 Docker 端口转发是否仍是瓶颈）
+
+## 7. 已知坑（开发时注意）
+
+- **PowerShell 内联 node**：含正则/引号转义出错，一律写文件脚本再 `node xxx.mjs`。
+- **容器内探针**：容器以 `node` 用户运行（/app 只读，日志写 /tmp）；探针持 unref'd worker 时
+  await 不 settle 会以退出码 13 结束（事件循环空转），加 `setInterval` 保活。
+- **登录限流**：5 次/分钟/IP+账号，测试脚本串行跑、间隔 60s+。
+- **预览交互**：单击**文件名单元格**触发预览（行双击仅目录有效）；UI 下载 = window.open 预签名 URL
+  （attachment 响应浏览器直接下载、不导航新页签）。
+- **nginx 动态解析（已根治 502）**：`deploy/nginx/nginx.conf` 的 `/api/` location 用
+  `resolver 127.0.0.11 valid=10s ipv6=off` + `set $backend http://server:3000` + `proxy_pass $backend`
+  动态解析 server 域名（Docker 内置 DNS）。实测强制 server IP 变更后 **不重启 web，≤10s 自动恢复**。
+  注意：改 nginx.conf 需重建 web 镜像（配置构建期拷入）；修配置勿回退为静态 `proxy_pass http://server:3000`。
+- **Redis 缓存键含 userId**：ACL 权限摘要是按用户解析的，勿去掉 userId 共享缓存。
+- **ioredis v6**：用 `import { Redis } from 'ioredis'`（默认导出在 NodeNext 下类型异常）。
+- **N: 盘是慢速数据盘**（直读 620MB/s），bind mount 进一步降速——性能结论以第 5 节为准。
+- **.wslconfig**：`memory=6GB processors=4 swap=2GB localhostForwarding=true`（备份 `.wslconfig.bak`）。
+
+## 8. 关机/恢复命令速查
 
 ```powershell
-# 浼橀泤鍋滄湇锛堝叧鏈哄墠锛?cd N:\濂囨€濆鎯砛minio-netdisk
-docker compose stop        # 淇濈暀瀹瑰櫒涓庢暟鎹嵎锛屽紑鏈哄悗 up 鍗虫仮澶?# 寮€鏈烘仮澶?docker compose up -d
+# 优雅停服（关机前）
+cd N:\奇思妙想\minio-netdisk
+docker compose stop        # 保留容器与数据卷，开机后 up 即恢复
+# 开机恢复
+docker compose up -d
 ```
