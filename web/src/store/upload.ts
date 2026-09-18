@@ -14,7 +14,7 @@ import { downloadToFile, type DownloadCtx } from '../utils/downloader';
 import { filesApi } from '../api';
 import { reportUploadInterrupt } from '../utils/metrics';
 import { backoffDelay, isAbortError } from '../utils/retry';
-import { FILE_PERSIST_LIMIT, loadResumeRecord } from '../utils/resume-store';
+import { loadResumeRecord } from '../utils/resume-store';
 
 export type TaskKind = 'upload' | 'download';
 
@@ -115,6 +115,12 @@ interface UploadState {
   attachFile: (id: string, file: File) => { ok: boolean; reason?: string; warning?: string };
   /** 当前需要重新选择本地文件的失败任务 id（供 UI 决定是否弹文件选择框） */
   needsFileIds: () => string[];
+  /**
+   * 「重新开始」一个失败的上传任务（v1.1.16）：
+   *   ① 断点记录里仍有文件内容（IndexedDB 持久化）→ 直接续传，用户什么都不用选；
+   *   ② 没有内容 → 返回 'need-file'，由 UI 打开文件选择框（并说明原因）。
+   */
+  restartTask: (id: string) => Promise<'resumed' | 'need-file' | 'none'>;
   /** 暂停单个任务（v1.1.5）：中断在传请求，保留断点 */
   pauseTask: (id: string) => void;
   /** 继续单个任务（v1.1.5）：重新入队，断点续传 */
@@ -227,15 +233,16 @@ function fmtSize(n: number): string {
   return n + ' B';
 }
 
-/** 「刷新后需要重新选择本地文件」的提示文案（v1.1.13） */
+/** 「刷新后需要重新开始」的提示文案（v1.1.16：浏览器留有内容会自动续传，只有内容丢了才需选文件） */
 export const NEEDS_FILE_MSG =
-  '页面刷新后本地文件引用已丢失：点「重新选择文件」选回同一个文件即可断点续传（已传分片保留在服务端）';
+  '刷新导致中断：点「重新开始」即可接着传（浏览器若仍留有该文件内容会直接续传；内容已不在时才需要选回文件）';
 
 /**
  * 标记任务「缺少本地文件引用」（v1.1.13）。
  * 旧实现的致命缺陷：这类任务被排队后，runUploadTask 里执行 `file.name` 抛 TypeError，
  * 任务在几十毫秒内又变回「失败」——用户看到的就是「点重试/重试失败都没反应」。
- * 现在一律不再排队，而是明确要求用户重选文件。
+ * v1.1.16：浏览器里持久化的文件内容通常仍可用，用户点「重新开始」即可续传；
+ *         只有内容超预算被丢弃/换设备时才需要重新选文件。
  */
 function markNeedsFile(id: string): void {
   useUploadStore.setState((s) => {
@@ -635,6 +642,35 @@ export const useUploadStore = create<UploadState>((set, get) => ({
     Object.values(get().tasks)
       .filter((t) => t.kind !== 'download' && !t.file && t.status !== 'completed' && t.status !== 'dedup')
       .map((t) => t.id),
+
+  // 「重新开始」：优先用浏览器里持久化的文件内容续传；没有内容才请用户选文件（v1.1.16）
+  restartTask: async (id) => {
+    const t = get().tasks[id];
+    if (!t) return 'none';
+    if (t.kind === 'download') {
+      get().retryTask(id);
+      return 'resumed';
+    }
+    if (t.file) {
+      get().retryTask(id);
+      return 'resumed';
+    }
+    try {
+      const rec = await loadResumeRecord(resumeKey(t.dirId, t.fileName, t.size));
+      const f = rec?.file;
+      if (f && f.size === t.size) {
+        const r = get().attachFile(id, f);
+        if (r.ok) {
+          console.warn(`[resume] 「重新开始」命中本地持久化内容，直接续传：${t.fileName}`);
+          return 'resumed';
+        }
+      }
+    } catch {
+      /* IndexedDB 不可用 → 走选文件 */
+    }
+    markNeedsFile(id);
+    return 'need-file';
+  },
 
   // 补上本地文件引用并立即重新入队（v1.1.13）：断点续传（IndexedDB 记录按 目录+文件名+大小 索引）
   attachFile: (id, file) => {
@@ -1118,30 +1154,33 @@ export function hydrateTaskList(): void {
   }
   if (Object.keys(restored).length === 0) return;
   useUploadStore.setState((s) => ({ tasks: restored, visible: true, ...(s.panelMode === 'dock' ? {} : { panelCollapsed: false }) }));
-  // 小文件（≤8MB）的 File 引用被存进了 IndexedDB 续传记录 → 直接自动续传同一个任务（不新建重复条目）
-  void autoResumeSmallFromRecords(restored);
+  // 断点记录里带文件内容 → 直接自动续传原任务（v1.1.16：大小不限，是否留有内容由存储预算决定）
+  void autoResumeFromRecords(restored);
 }
 
 /**
- * 刷新后用 IndexedDB 里保存的 File 引用自动续传小文件（v1.1.13）。
- * 背景：小文件（≤8MB）上传时，续传记录里连 File 一起存了（resume-store.FILE_PERSIST_LIMIT），
- * 所以不必让用户重选；大文件浏览器无法持久化 File，只能由用户重新选择（needsFile）。
+ * 刷新后用 IndexedDB 里保存的文件内容自动续传（v1.1.13 起为小文件，v1.1.16 起不限大小）。
+ * 背景：浏览器无法在 localStorage 里保存 File，但 **IndexedDB 可以**（resume-store 按预算持久化内容），
+ * 所以只要内容还在，刷新后就能自己接着传，用户不需要再点任何按钮、也不需要重新选择文件。
  */
-async function autoResumeSmallFromRecords(restored: Record<string, UploadTask>): Promise<void> {
-  const targets = Object.values(restored).filter((t) => t.needsFile && t.size > 0 && t.size <= FILE_PERSIST_LIMIT);
+async function autoResumeFromRecords(restored: Record<string, UploadTask>): Promise<void> {
+  const targets = Object.values(restored).filter((t) => t.needsFile && t.size > 0);
   if (targets.length === 0) return;
+  let resumed = 0;
   for (const t of targets) {
     try {
       const rec = await loadResumeRecord(resumeKey(t.dirId, t.fileName, t.size));
       const f = rec?.file;
-      if (!f) continue; // 没有持久化的 File → 保持 needsFile，等用户重选
+      if (!f) continue; // 没有持久化的文件内容 → 保持 needsFile，等用户点「重新开始」
       const cur = useUploadStore.getState().tasks[t.id];
       if (!cur || !cur.needsFile) continue; // 用户已经手动处理过
       useUploadStore.getState().attachFile(t.id, f);
+      resumed += 1;
     } catch {
-      /* IndexedDB 不可用：保持 needsFile（用户点「重新选择文件」） */
+      /* IndexedDB 不可用：保持 needsFile（用户点「重新开始」） */
     }
   }
+  if (resumed > 0) console.warn(`[resume] 刷新后自动续传 ${resumed} 个任务（无需手动重选文件）`);
 }
 
 // 订阅 store：任务变化时节流持久化（含进度更新）

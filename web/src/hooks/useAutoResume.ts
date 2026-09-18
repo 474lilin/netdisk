@@ -1,10 +1,10 @@
-// 断点续传自动恢复（v1.1 第三轮 3.3）：
-// 页面加载时读取 IndexedDB 中未完成的续传记录——小文件（带 File 引用）自动重新入队，
-// 上传引擎会命中 IndexedDB 记录续传（不重新上传已传分片）
+// 断点续传自动恢复（v1.1 第三轮 3.3；v1.1.16 起不再限制文件大小）：
+// 页面加载时读取 IndexedDB 中未完成的续传记录——**只要记录里带着文件内容**就自动重新入队，
+// 上传引擎命中记录后续传缺失分片（刷新浏览器不再导致上传失败，也不需要用户重新选择文件）。
 // 审查加固（v1.1.1）：分批恢复（每批 50，让出主线程）——并发槽位由队列 pump 限流（≤6），
 // 避免极端大批量（21k 全中断）同步循环阻塞主线程
 import { useEffect, useRef } from 'react';
-import { loadResumeRecords, FILE_PERSIST_LIMIT } from '../utils/resume-store';
+import { loadResumeRecords } from '../utils/resume-store';
 import { useUploadStore } from '../store/upload';
 
 const BATCH_SIZE = 50;
@@ -17,12 +17,10 @@ export function useAutoResume(): void {
     void (async () => {
       try {
         const records = await loadResumeRecords();
-        // 仅恢复带 File 引用（小文件）且未完成的会话：
+        // 仅恢复「带文件内容」且未完成的会话（大小不限，由 resume-store 的存储预算决定是否留有内容）：
         //   - 分片会话（totalParts > 1）：续传缺失分片
         //   - 单请求直传已 PUT 待 complete（mode1Pending，v1.1.5）：直接补 complete，秒级完成
-        const resumeable = records.filter(
-          (r) => r.file && r.size <= FILE_PERSIST_LIMIT && (r.totalParts > 1 || r.mode1Pending)
-        );
+        const resumeable = records.filter((r) => r.file && (r.totalParts > 1 || r.mode1Pending));
         if (resumeable.length === 0) return;
         // 去重：同一文件只入队一次
         const seen = new Set<string>();

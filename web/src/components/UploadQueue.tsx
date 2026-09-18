@@ -119,6 +119,7 @@ export default function UploadQueue() {
   const retryTask = useUploadStore((s) => s.retryTask);
   const retryAllFailed = useUploadStore((s) => s.retryAllFailed);
   const attachFile = useUploadStore((s) => s.attachFile);
+  const restartTask = useUploadStore((s) => s.restartTask);
   const pauseTask = useUploadStore((s) => s.pauseTask);
   const resumeTask = useUploadStore((s) => s.resumeTask);
   const pauseAll = useUploadStore((s) => s.pauseAll);
@@ -150,10 +151,11 @@ export default function UploadQueue() {
     if (n > 0) message.success(`已清除 ${n} 条失败任务记录（网盘里已上传的文件不受影响）`);
   };
 
-  // ---------- 重试（v1.1.13：刷新后缺文件的任务改走「重新选择文件」） ----------
-  // 背景：刷新/重开页面后，浏览器不允许恢复 File 对象，任务只剩名字与大小。
-  // 旧实现点「重试」会直接把它排队 → 上传执行体读 file.name 抛错 → 几十毫秒后又变回失败，
-  // 用户看到的就是「按钮点了没反应」。现在改为：先让用户选回同一个文件，再断点续传。
+  // ---------- 「重新开始」/重试（v1.1.16） ----------
+  // 背景：浏览器不允许在 localStorage 里保存 File，刷新后任务只剩名字与大小。
+  // 现在的策略（尽量不让用户选文件）：
+  //   ① 浏览器的 IndexedDB 里**存了文件内容**（resume-store 按预算持久化）→ 直接续传，零操作；
+  //   ② 内容已不在（超过单文件/总预算上限、或换了浏览器/设备）→ 才弹文件选择框，且**一次多选批量**。
   /** 该任务是否缺少本地文件引用（刷新后还原的上传任务） */
   const needsFileOf = (t: UploadTask): boolean => t.kind !== 'download' && !t.file;
   /** 当前所有等待重选文件的失败任务（实时读 store，避免 1s 快照延迟） */
@@ -162,50 +164,81 @@ export default function UploadQueue() {
     return all.filter((t) => needsFileOf(t) && t.status === 'error');
   };
 
-  const handleRetryOne = async (t: UploadTask): Promise<void> => {
+  /** 单个任务「重新开始」：先尝试用持久化内容续传，失败才请用户选文件 */
+  const handleRestartOne = async (t: UploadTask): Promise<void> => {
     if (!needsFileOf(t)) {
       retryTask(t.id);
       return;
     }
+    const r = await restartTask(t.id);
+    if (r === 'resumed') {
+      message.success(`「${t.fileName}」已从断点继续上传（浏览器里仍留有文件内容，无需重选）`);
+      return;
+    }
     const picked = await pickFiles({ multiple: false });
     if (picked.length === 0) {
-      message.info(`未选择文件：「${t.fileName}」需要选回刷新前那一个文件才能续传。`);
+      message.info(`未选择文件：「${t.fileName}」的本地内容已不在浏览器缓存里，需要选回同一个文件才能续传。`);
       return;
     }
-    const r = attachFile(t.id, picked[0]);
-    if (!r.ok) {
-      message.error(r.reason ?? '文件不匹配');
+    const res = attachFile(t.id, picked[0]);
+    if (!res.ok) {
+      message.error(res.reason ?? '文件不匹配');
       return;
     }
-    if (r.warning) message.warning(r.warning);
+    if (res.warning) message.warning(res.warning);
     message.success(`已选回「${picked[0].name}」，从断点继续上传（不重复上传已传分片）`);
   };
 
-  const handleRetryAll = async (): Promise<void> => {
-    const need = collectNeedsFile();
+  /** 批量「重新开始」：能自动续传的先自动续传，剩下的**一次多选**补上 */
+  const handleRestartAll = async (): Promise<void> => {
+    let need = collectNeedsFile();
     if (need.length > 0) {
-      message.info(`有 ${need.length} 个任务在刷新前被中断，需要重新选择这些文件才能续传`);
-      const picked = await pickFiles({ multiple: true });
-      const used = new Set<number>();
+      // ① 先让有持久化内容的自己续传（通常大部分都能自动走掉）
+      const manual: UploadTask[] = [];
       for (const t of need) {
-        const idx = picked.findIndex(
-          (f, i) => !used.has(i) && f.name === t.fileName && f.size === t.size
-        );
-        if (idx >= 0) {
-          used.add(idx);
-          attachFile(t.id, picked[idx]);
-        }
+        const r = await restartTask(t.id);
+        if (r === 'need-file') manual.push(t);
       }
-      const stillMissing = collectNeedsFile();
-      if (stillMissing.length > 0) {
-        const names = stillMissing.slice(0, 5).map((t) => t.fileName).join('、');
-        message.warning(
-          `仍有 ${stillMissing.length} 个任务没有选回文件：${names}${stillMissing.length > 5 ? ' 等' : ''}。请逐个点任务右侧的「重新选择文件」。`
-        );
+      if (manual.length === 0) {
+        message.success(`${need.length} 个中断任务已用浏览器缓存的文件内容自动续传（无需重选文件）`);
+      } else {
+        message.info(`有 ${manual.length} 个任务的本地内容已不在浏览器缓存里，请在弹窗里**一次多选**这些文件`);
+        const picked = await pickFiles({ multiple: true });
+        const used = new Set<number>();
+        for (const t of manual) {
+          const idx = picked.findIndex((f, i) => !used.has(i) && f.name === t.fileName && f.size === t.size);
+          if (idx >= 0) {
+            used.add(idx);
+            attachFile(t.id, picked[idx]);
+          }
+        }
+        const stillMissing = collectNeedsFile();
+        if (stillMissing.length > 0) {
+          const names = stillMissing.slice(0, 5).map((t) => t.fileName).join('、');
+          message.warning(
+            `仍有 ${stillMissing.length} 个任务没有选到文件：${names}${stillMissing.length > 5 ? ' 等' : ''}。可再点一次「重新开始」。`
+          );
+        }
       }
     }
     retryAllFailed(); // 有本地文件的失败任务（网络/服务端错误）照常重试
   };
+
+  // 有任务在上传时刷新/关闭页面给出浏览器确认（v1.1.16）：避免误刷新导致中断
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent): string | undefined => {
+      const s = useUploadStore.getState();
+      const active = Object.values(s.tasks).some(
+        (t) => t.status === 'uploading' || t.status === 'hashing' || t.status === 'queued'
+      );
+      if (!active) return undefined;
+      e.preventDefault();
+      e.returnValue = '';
+      return '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
 
   // 注意：不再监听 Esc 收起面板（v1.1.9）——
   // 旧行为会导致「按 Esc 关预览/弹窗时，上传队列一起收成图标细栏」，
@@ -542,7 +575,7 @@ export default function UploadQueue() {
             </Button>
           </Tooltip>
           <Tooltip title="重试全部失败任务（刷新前中断的任务会先弹出文件选择框，选回文件即断点续传）">
-            <Button size="small" icon={<ReloadOutlined />} disabled={totalFailed === 0} onClick={() => void handleRetryAll()}>
+            <Button size="small" icon={<ReloadOutlined />} disabled={totalFailed === 0} onClick={() => void handleRestartAll()}>
               重试失败
             </Button>
           </Tooltip>
@@ -602,12 +635,12 @@ export default function UploadQueue() {
                   ) : null,
                   (failed || (dl && t.status === 'canceled')) ? (
                     needsFileOf(t) ? (
-                      <Tooltip key="pick" title="刷新后本地文件引用已丢失：点此选回同一个文件，从断点继续上传">
+                      <Tooltip key="restart" title="重新开始上传：浏览器若仍留有该文件内容会直接续传，否则才需要选回文件">
                         <Button
                           size="small"
                           type="text"
-                          icon={<FolderOpenOutlined />}
-                          onClick={() => void handleRetryOne(t)}
+                          icon={<ReloadOutlined />}
+                          onClick={() => void handleRestartOne(t)}
                         />
                       </Tooltip>
                     ) : (
@@ -790,7 +823,7 @@ export default function UploadQueue() {
             全部继续{pausedCount > 0 ? `（${pausedCount}）` : ''}
           </Button>
           {totalFailed > 0 && (
-            <Button block size="small" icon={<ReloadOutlined />} onClick={() => void handleRetryAll()}>
+            <Button block size="small" icon={<ReloadOutlined />} onClick={() => void handleRestartAll()}>
               重试失败（{totalFailed}）
             </Button>
           )}

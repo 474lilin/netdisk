@@ -173,6 +173,49 @@ let pendingWrites = new Map<string, ResumeRecord>();
 let deletedKeys = new Set<string>(); // 已删除 key（防止在途 flush 写回）
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
+/**
+ * 文件内容持久化预算（v1.1.16）
+ *   目的：刷新浏览器后能**直接续传**，不需要用户逐个"重新选择文件"。
+ *   IndexedDB 可以存 File/Blob，代价是占用浏览器配额（C 盘空间）。
+ *   策略：单文件 ≤ PRESERVE_MAX_FILE 才存内容；所有记录的**文件内容**总量控制在 PRESERVE_MAX_TOTAL 内，
+ *        超预算时按 updatedAt 从旧到新丢弃内容（只保留断点进度，任务仍可续传但需重新选择文件）。
+ */
+const PRESERVE_MAX_FILE = 1024 * 1024 * 1024; // 1GB：超过此大小的单个文件不存内容
+const PRESERVE_MAX_TOTAL = 4 * 1024 * 1024 * 1024; // 4GB：文件内容总预算
+
+function stripFile(rec: ResumeRecord): ResumeRecord {
+  const { file: _file, ...rest } = rec;
+  return rest as ResumeRecord;
+}
+
+/** 超预算时丢弃最旧记录的文件内容（不影响断点进度本身） */
+async function pruneFileContents(): Promise<void> {
+  if (idbUnavailable) return;
+  try {
+    const all = await tx<ResumeRecord[]>('readonly', (s) => s.getAll());
+    const withFile = all.filter((r) => r.file);
+    let total = withFile.reduce((a, r) => a + (r.file?.size ?? 0), 0);
+    if (total <= PRESERVE_MAX_TOTAL) return;
+    const oldestFirst = withFile.sort((a, b) => a.updatedAt - b.updatedAt);
+    const drop: string[] = [];
+    for (const r of oldestFirst) {
+      if (total <= PRESERVE_MAX_TOTAL) break;
+      total -= r.file?.size ?? 0;
+      drop.push(r.key);
+    }
+    if (drop.length === 0) return;
+    await tx('readwrite', (s) => {
+      for (const rec of all) {
+        if (drop.includes(rec.key)) s.put(stripFile(rec));
+      }
+      return s.count() as IDBRequest<number>;
+    });
+    console.info(`[resume] 文件内容预算已满，丢弃 ${drop.length} 条最旧记录的内容副本（断点进度保留）`);
+  } catch {
+    /* 预算清理失败不影响主流程 */
+  }
+}
+
 /** 合并写：同一 key 多次调用只保留最新状态，统一刷入存储（默认 500ms 内合并） */
 export async function saveResumeRecord(rec: ResumeRecord): Promise<void> {
   pendingWrites.set(rec.key, { ...rec, updatedAt: Date.now() });
@@ -202,10 +245,14 @@ async function flushBatch(batch: Map<string, ResumeRecord>): Promise<void> {
   try {
     await tx('readwrite', (s) => {
       for (const rec of batch.values()) {
-        s.put(rec); // 完整记录含 File（IndexedDB 结构化克隆支持 Blob/File；自动恢复依赖）
+        // v1.1.16：**把文件内容一起存**（IndexedDB 结构化克隆支持 File/Blob），
+        // 这样刷新浏览器后可以直接续传，不必再让用户逐个"重新选择文件"。
+        // 超过单文件上限的不存内容（只存断点进度），避免把浏览器配额吃满。
+        s.put(rec.file && rec.file.size > PRESERVE_MAX_FILE ? stripFile(rec) : rec);
       }
       return s.count() as IDBRequest<number>;
     });
+    void pruneFileContents();
   } catch {
     // IndexedDB 失败 → 降级 localStorage（File 引用无法序列化，丢弃）
     markUnavailable('写入续传记录失败（降级 localStorage）');

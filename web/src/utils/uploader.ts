@@ -42,7 +42,7 @@ import {
   removeResumeRecord,
   flushResumeWrites,
   mergeServerParts,
-  FILE_PERSIST_LIMIT,
+  FILE_PERSIST_LIMIT as _FILE_PERSIST_LIMIT_UNUSED,
   type ResumeRecord,
 } from './resume-store';
 
@@ -539,8 +539,9 @@ export async function runUploadTask(
         { retries: 4, signal, shouldRetry: isTransientError }
       );
       if (signal?.aborted) return pausedResult();
-      if (file.size <= FILE_PERSIST_LIMIT) {
-        // PUT 已完成、仅待 complete：登记记录——complete 失败/刷新后可跳过重传直接补 complete
+      {
+        // PUT 已完成、仅待 complete：登记记录（**带上 File**，v1.1.16：刷新后可自动补 complete）
+        // 是否真的把内容写进 IndexedDB 由 resume-store 的预算策略决定（超上限则只存进度）
         void saveResumeRecord({
           sessionId,
           key,
@@ -602,7 +603,7 @@ export async function runUploadTask(
       // 该分片按整片计字节（进度条在分片完成时补齐）
       partBytes.set(partNumber, Math.min(partSize, Math.max(0, file.size - (partNumber - 1) * partSize)));
       emitBytes();
-      // 持久化进度（IndexedDB；小文件带 File 引用 → 刷新后自动恢复）
+      // 持久化进度 + 文件内容（v1.1.16：带 File，刷新后可自动续传，无需用户重选）
       // recordWrites: 本轮已判定终止（暂停/会话失效）后，兄弟分片迟到的完成回调不得再写记录
       // ——否则会「复活」已作废的会话，重试时按失败会话续传，导致卡死或无限重试
       if (recordWrites) {
@@ -615,7 +616,7 @@ export async function runUploadTask(
           partSize,
           totalParts,
           partsEtag: { ...uploaded },
-          ...(file.size <= FILE_PERSIST_LIMIT ? { file } : {}),
+          file,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         });
