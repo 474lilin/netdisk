@@ -14,7 +14,7 @@ import { downloadToFile, type DownloadCtx } from '../utils/downloader';
 import { filesApi } from '../api';
 import { reportUploadInterrupt } from '../utils/metrics';
 import { backoffDelay, isAbortError } from '../utils/retry';
-import { loadResumeRecord } from '../utils/resume-store';
+import { fileFromHandle, loadFileHandle, loadResumeRecord, removeFileHandle, saveFileHandle } from '../utils/resume-store';
 
 export type TaskKind = 'upload' | 'download';
 
@@ -89,7 +89,7 @@ interface UploadState {
   paused: boolean;
   /** 上一次暂停原因（埋点/UI 提示）：token_expired=登录过期；user=用户手动全部暂停 */
   pauseReason?: string;
-  addFiles: (files: File[], dirId: string) => void;
+  addFiles: (files: File[], dirId: string, handles?: (FileSystemFileHandle | undefined)[]) => void;
   /** 新增下载任务（v1.1.10）：立即启动（并发上限 2），进度/成功/失败都在同一列表展示 */
   addDownload: (spec: {
     name: string;
@@ -510,10 +510,10 @@ export const useUploadStore = create<UploadState>((set, get) => ({
   pauseReason: undefined,
   _running: 0,
 
-  addFiles: (files, dirId) => {
+  addFiles: (files, dirId, handles) => {
     const additions: Record<string, UploadTask> = {};
     const newIds: string[] = [];
-    for (const file of files) {
+    files.forEach((file, i) => {
       const id = crypto.randomUUID();
       additions[id] = {
         id,
@@ -527,7 +527,13 @@ export const useUploadStore = create<UploadState>((set, get) => ({
         bytesDone: 0,
       };
       newIds.push(id);
-    }
+      // v1.1.17：把浏览器文件句柄一起存下来——刷新后可凭句柄直接续传（大小不限、无需重选文件）
+      const h = handles?.[i];
+      if (h) {
+        const key = resumeKey(dirId, file.name, file.size);
+        void saveFileHandle(key, h);
+      }
+    });
     // 新任务入队时清除「用户全部暂停」标记：新增文件即代表用户要继续传（登录过期暂停不受影响）
     // 同时展开列表（刚拖入文件时给出明确反馈），并同步持久化最小化偏好
     writePanelCollapsed(false);
@@ -655,8 +661,27 @@ export const useUploadStore = create<UploadState>((set, get) => ({
       get().retryTask(id);
       return 'resumed';
     }
+    const key = resumeKey(t.dirId, t.fileName, t.size);
+    // ① 文件句柄（v1.1.17）：凭句柄重新读取原文件，**不限大小、不需要重新选择文件**
+    //    （interactive=true：这里由用户点击触发，若浏览器需要授权会弹一次"允许读取"提示）
     try {
-      const rec = await loadResumeRecord(resumeKey(t.dirId, t.fileName, t.size));
+      const handle = await loadFileHandle(key);
+      if (handle) {
+        const f = await fileFromHandle(handle, t.size, true);
+        if (f) {
+          const r = get().attachFile(id, f);
+          if (r.ok) {
+            console.warn(`[resume] 「重新开始」命中浏览器文件句柄，直接续传：${t.fileName}`);
+            return 'resumed';
+          }
+        }
+      }
+    } catch {
+      /* 句柄不可用 → 继续尝试其它途径 */
+    }
+    // ② 浏览器里持久化的文件内容（小文件兜底路径）
+    try {
+      const rec = await loadResumeRecord(key);
       const f = rec?.file;
       if (f && f.size === t.size) {
         const r = get().attachFile(id, f);
@@ -1168,16 +1193,32 @@ async function autoResumeFromRecords(restored: Record<string, UploadTask>): Prom
   if (targets.length === 0) return;
   let resumed = 0;
   for (const t of targets) {
+    const key = resumeKey(t.dirId, t.fileName, t.size);
     try {
-      const rec = await loadResumeRecord(resumeKey(t.dirId, t.fileName, t.size));
-      const f = rec?.file;
-      if (!f) continue; // 没有持久化的文件内容 → 保持 needsFile，等用户点「重新开始」
+      const cur0 = useUploadStore.getState().tasks[t.id];
+      if (!cur0 || !cur0.needsFile) continue; // 用户已经手动处理过
+      // ① 文件句柄（非交互：浏览器若已记住授权则静默续传，否则留给用户点「重试失败」时再授权）
+      const handle = await loadFileHandle(key);
+      if (handle) {
+        const f = await fileFromHandle(handle, t.size, false);
+        if (f) {
+          const r = useUploadStore.getState().attachFile(t.id, f);
+          if (r.ok) {
+            resumed += 1;
+            continue;
+          }
+        }
+      }
+      // ② 浏览器里持久化的文件内容
+      const rec = await loadResumeRecord(key);
+      const blob = rec?.file;
+      if (!blob) continue;
       const cur = useUploadStore.getState().tasks[t.id];
-      if (!cur || !cur.needsFile) continue; // 用户已经手动处理过
-      useUploadStore.getState().attachFile(t.id, f);
+      if (!cur || !cur.needsFile) continue;
+      useUploadStore.getState().attachFile(t.id, blob);
       resumed += 1;
     } catch {
-      /* IndexedDB 不可用：保持 needsFile（用户点「重新开始」） */
+      /* IndexedDB 不可用：保持 needsFile（用户点「重试失败」） */
     }
   }
   if (resumed > 0) console.warn(`[resume] 刷新后自动续传 ${resumed} 个任务（无需手动重选文件）`);

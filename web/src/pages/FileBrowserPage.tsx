@@ -170,7 +170,11 @@ export default function FileBrowserPage() {
   // （此前逐组串行 mkdir：3195 个目录组导致队列长期空转，上传速率被目录创建拖垮）
   const mkdirParallelLimit = 12;
 
-  const prepareUploads = async (files: File[], baseDirId: string): Promise<void> => {
+  const prepareUploads = async (
+    files: File[],
+    baseDirId: string,
+    handleMap?: Map<File, FileSystemFileHandle>
+  ): Promise<void> => {
     // 1) 收集目录路径（去重）
     const dirPaths = new Set<string>();
     const fileGroups = new Map<string, File[]>();
@@ -234,16 +238,33 @@ export default function FileBrowserPage() {
     for (const [path, list] of fileGroups) {
       const dirIdNow = path ? dirIdByPath.get(path) : baseDirId;
       if (!dirIdNow) { skipped += list.length; continue; }
-      useUploadStore.getState().addFiles(list, dirIdNow);
+      // v1.1.17：把浏览器文件句柄一并交给队列（刷新后可凭句柄续传，大小不限、无需重选文件）
+      useUploadStore.getState().addFiles(list, dirIdNow, handleMap ? list.map((f) => handleMap.get(f)) : undefined);
     }
     if (dirFailCount > 0 || skipped > 0) {
       message.warning(`${dirFailCount} 个目录创建失败，${skipped} 个文件未加入队列`);
     }
   };
 
-  const onFilesSelected = (fileList: File[]): void => {
+  const onFilesSelected = (fileList: File[], handles?: (FileSystemFileHandle | undefined)[]): void => {
     if (!dirId) return;
-    void prepareUploads(fileList, dirId);
+    const map = new Map<File, FileSystemFileHandle>();
+    if (handles) fileList.forEach((f, i) => { const h = handles[i]; if (h) map.set(f, h); });
+    void prepareUploads(fileList, dirId, map);
+  };
+
+  /** 选择文件（v1.1.17）：优先用 File System Access 选择器以便拿到文件句柄（刷新后可自动续传，大小不限） */
+  const legacyFileInputRef = useRef<HTMLInputElement | null>(null);
+  const pickFilesWithHandles = async (): Promise<{ files: File[]; handles: (FileSystemFileHandle | undefined)[] } | null> => {
+    const w = window as unknown as { showOpenFilePicker?: (o: unknown) => Promise<FileSystemFileHandle[]> };
+    if (typeof w.showOpenFilePicker !== 'function') return null; // 浏览器不支持 → 走原来的 <input type="file">
+    try {
+      const handles = await w.showOpenFilePicker({ multiple: true });
+      const files = await Promise.all(handles.map((h) => h.getFile()));
+      return { files, handles };
+    } catch {
+      return { files: [], handles: [] }; // 用户取消
+    }
   };
 
   const collectDropped = async (e: React.DragEvent): Promise<void> => {
@@ -251,6 +272,22 @@ export default function FileBrowserPage() {
     setDragging(false);
     if (!dirId || !e.dataTransfer?.items) return;
     const files: File[] = [];
+    const handleMap = new Map<File, FileSystemFileHandle>();
+    // v1.1.17：拖拽的顶层文件尽量拿文件句柄（Chrome/Edge 支持），刷新后可凭句柄续传
+    for (const item of Array.from(e.dataTransfer.items)) {
+      const getHandle = (item as unknown as { getAsFileSystemHandle?: () => Promise<FileSystemFileHandle | null> })
+        .getAsFileSystemHandle;
+      if (typeof getHandle !== 'function') continue;
+      try {
+        const h = await getHandle.call(item);
+        if (h && h.kind === 'file') {
+          const f = await h.getFile();
+          handleMap.set(f, h);
+        }
+      } catch {
+        /* 单个拖拽项取句柄失败：不影响上传 */
+      }
+    }
     const walk = async (entry: FileSystemEntry, path: string): Promise<void> => {
       if (entry.isFile) {
         const fileEntry = entry as FileSystemFileEntry;
@@ -283,7 +320,7 @@ export default function FileBrowserPage() {
       const entry = item.webkitGetAsEntry?.();
       if (entry) await walk(entry, '');
     }
-    if (files.length > 0) await prepareUploads(files, dirId);
+    if (files.length > 0) await prepareUploads(files, dirId, handleMap);
   };
 
   // ---------- 操作 ----------
@@ -465,11 +502,47 @@ export default function FileBrowserPage() {
             onChange={(e) => setFilter(e.target.value)}
             style={{ width: isMobile ? '100%' : 180 }}
           />
-          <Upload {...uploadProps} disabled={!rights.write}>
-            <Button type="primary" icon={<UploadOutlined />} disabled={!rights.write}>
-              上传文件
-            </Button>
-          </Upload>
+          {/* v1.1.17：支持 File System Access 的浏览器用系统选择器（能拿到文件句柄 → 刷新后可自动续传，
+              大小不限、无需重选）；其它浏览器回退到 antd Upload（行为不变） */}
+          {(window as unknown as { showOpenFilePicker?: unknown }).showOpenFilePicker ? (
+            <>
+              <Button
+                type="primary"
+                icon={<UploadOutlined />}
+                disabled={!rights.write}
+                onClick={() => {
+                  void (async () => {
+                    const r = await pickFilesWithHandles();
+                    if (!r) {
+                      legacyFileInputRef.current?.click(); // 系统选择器不可用 → 回退普通 input
+                      return;
+                    }
+                    if (r.files.length > 0) onFilesSelected(r.files, r.handles);
+                  })();
+                }}
+              >
+                上传文件
+              </Button>
+              {/* 兼容/回退通道：普通文件输入（同样走上传队列，只是拿不到文件句柄） */}
+              <input
+                ref={legacyFileInputRef}
+                type="file"
+                multiple
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  const list = Array.from(e.target.files ?? []);
+                  if (list.length > 0) onFilesSelected(list);
+                  e.target.value = '';
+                }}
+              />
+            </>
+          ) : (
+            <Upload {...uploadProps} disabled={!rights.write}>
+              <Button type="primary" icon={<UploadOutlined />} disabled={!rights.write}>
+                上传文件
+              </Button>
+            </Upload>
+          )}
           <Button icon={<FolderAddOutlined />} disabled={!rights.write} onClick={() => folderInputRef.current?.click()}>
             上传文件夹
           </Button>

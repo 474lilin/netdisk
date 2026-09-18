@@ -23,6 +23,13 @@ export interface ResumeRecord {
   mode1Pending?: boolean;
   /** 客户端内容哈希：恢复/补 complete 前校验内容未变（防止同名同大小的旧内容被误提交） */
   sha256?: string;
+  /**
+   * 浏览器文件句柄（v1.1.17，File System Access API）：
+   * 上传时若拿到句柄，刷新后可以**凭句柄重新读取原文件**（不复制内容、不限文件大小），
+   * 用户最多只需要在提示里点一次"允许读取"，不需要重新选择文件。
+   * 句柄是结构化可克隆对象，能直接存进 IndexedDB（Chrome/Edge 支持）。
+   */
+  fileHandle?: FileSystemFileHandle;
   createdAt: number;
   updatedAt: number;
 }
@@ -380,6 +387,71 @@ export async function clearAllResume(): Promise<void> {
 
 /** FileItem 类型再导出（供 uploader 使用） */
 export type { FileItem };
+
+// ---------- 文件句柄持久化（v1.1.17）----------
+// 单独用一条记录（key 前缀 handle:）保存 FileSystemFileHandle，与断点记录解耦：
+// 上传一开始就能写入句柄，之后刷新即可凭句柄重新读取原文件继续上传（大小不限、无需重选文件）。
+const HANDLE_PREFIX = 'handle:';
+
+export async function saveFileHandle(key: string, handle: FileSystemFileHandle): Promise<void> {
+  if (idbUnavailable) return;
+  try {
+    await tx('readwrite', (s) =>
+      s.put({ key: HANDLE_PREFIX + key, fileHandle: handle, updatedAt: Date.now() } as unknown as ResumeRecord)
+    );
+  } catch {
+    /* 句柄保存失败不影响上传本身 */
+  }
+}
+
+export async function loadFileHandle(key: string): Promise<FileSystemFileHandle | null> {
+  if (idbUnavailable) return null;
+  try {
+    const rec = await tx<{ fileHandle?: FileSystemFileHandle } | undefined>('readonly', (s) => s.get(HANDLE_PREFIX + key));
+    return rec?.fileHandle ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function removeFileHandle(key: string): Promise<void> {
+  if (idbUnavailable) return;
+  try {
+    await tx('readwrite', (s) => s.delete(HANDLE_PREFIX + key));
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 通过句柄取回文件（v1.1.17）。
+ * @param interactive 是否允许弹出授权提示（必须在用户手势里调用，例如点击「重试失败」）；
+ *                    false 时只接受"已授权"状态（用于刷新后的静默自动续传）。
+ * @returns 文件对象（大小不符/未授权则 null）
+ */
+export async function fileFromHandle(
+  handle: FileSystemFileHandle,
+  expectedSize: number,
+  interactive: boolean
+): Promise<File | null> {
+  try {
+    const h = handle as unknown as {
+      queryPermission?: (d: { mode: string }) => Promise<PermissionState>;
+      requestPermission?: (d: { mode: string }) => Promise<PermissionState>;
+    };
+    let state: PermissionState = 'granted';
+    if (typeof h.queryPermission === 'function') state = await h.queryPermission({ mode: 'read' });
+    if (state !== 'granted' && interactive && typeof h.requestPermission === 'function') {
+      state = await h.requestPermission({ mode: 'read' });
+    }
+    if (state !== 'granted') return null;
+    const f = await handle.getFile();
+    if (expectedSize > 0 && f.size !== expectedSize) return null; // 文件被改过：不能当断点来源
+    return f;
+  } catch {
+    return null;
+  }
+}
 
 // 测试/调试钩子（与 window.__uploadStore 一致）：现场排查「刷新后为什么不续传」时直接看这里
 if (typeof window !== 'undefined') {
