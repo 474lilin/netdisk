@@ -45,6 +45,21 @@ const MAX_RENDER = 200;
 const FLOAT_W = 380;
 const FLOAT_H = 460;
 
+/** 秒数 → 中文时长（v1.1.18） */
+function formatDuration(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} 分 ${s % 60} 秒`;
+  const h = Math.floor(m / 60);
+  return `${h} 小时 ${m % 60} 分`;
+}
+/** 预计完成时刻（本地时间 HH:MM，v1.1.18） */
+function etaClock(sec: number): string {
+  const d = new Date(Date.now() + sec * 1000);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
 const STATUS_META: Record<string, { color: string; label: string }> = {
   queued: { color: 'default', label: '等待中' },
   hashing: { color: 'processing', label: '计算哈希' },
@@ -323,29 +338,55 @@ export default function UploadQueue() {
     return [...focus, ...rest];
   }, [tasks]);
 
-  // 实时速率（每秒差分 bytesDone）
+  // 实时速率 + 预计剩余时间（v1.1.18）
+  //   速率：每秒差分 bytesDone，并做指数平滑（避免抖动导致 ETA 乱跳）
+  //   剩余时间：剩余字节 / 平滑速率；排队中/哈希中的任务还没有速率，不显示 ETA
   const [speeds, setSpeeds] = useState<Record<string, number>>({});
+  const [etas, setEtas] = useState<Record<string, number>>({});
   const prevRef = useRef<Record<string, { bytes: number; ts: number }>>({});
+  const emaRef = useRef<Record<string, number>>({});
   useEffect(() => {
     const timer = setInterval(() => {
       const now = Date.now();
       const list = Object.values(useUploadStore.getState().tasks);
       const next: Record<string, number> = {};
+      const nextEta: Record<string, number> = {};
       for (const t of list) {
         if (t.status !== 'uploading' && t.status !== 'hashing') continue;
         const prev = prevRef.current[t.id];
         if (prev) {
           const dt = (now - prev.ts) / 1000;
-          if (dt > 0.2) next[t.id] = Math.max(0, (t.bytesDone - prev.bytes) / dt);
+          if (dt > 0.2) {
+            const inst = Math.max(0, (t.bytesDone - prev.bytes) / dt);
+            const ema = emaRef.current[t.id] ? emaRef.current[t.id] * 0.6 + inst * 0.4 : inst;
+            emaRef.current[t.id] = ema;
+            next[t.id] = ema;
+            const remain = Math.max(0, t.size - t.bytesDone);
+            // 速率过低（<8KB/s）或已完成时不给 ETA，避免显示"剩余 999 小时"
+            if (t.status === 'uploading' && ema > 8192 && remain > 0) nextEta[t.id] = remain / ema;
+          }
         }
         prevRef.current[t.id] = { bytes: t.bytesDone, ts: now };
       }
       setSpeeds(next);
+      setEtas(nextEta);
     }, 1000);
     return () => clearInterval(timer);
   }, []);
 
   const overallSpeed = useMemo(() => Object.values(speeds).reduce((a, b) => a + b, 0), [speeds]);
+  /** 队列整体剩余时间（活动任务剩余字节 ÷ 当前总速率）；速率不可用时为 null */
+  const overallEta = useMemo(() => {
+    if (overallSpeed <= 8192) return null;
+    let remain = 0;
+    for (const t of tasks) {
+      if (isDownload(t)) continue;
+      if (t.status === 'uploading' || t.status === 'hashing' || t.status === 'queued') {
+        remain += Math.max(0, t.size - t.bytesDone);
+      }
+    }
+    return remain > 0 ? remain / overallSpeed : null;
+  }, [tasks, overallSpeed]);
 
   // 全部任务结束（成功/失败/暂停均视为已结束）：只做完成提示 + 完整性校验
   // v1.1.6：不再自动隐藏面板——任务列表常驻，由用户「清除已完成」或「最小化」决定去留
@@ -485,7 +526,13 @@ export default function UploadQueue() {
         size="small"
         status={totalFailed > 0 ? 'exception' : activeCount > 0 ? 'active' : 'normal'}
         style={{ margin: '0 0 6px' }}
-        format={(p) => `${p ?? 0}%${overallSpeed > 0 && activeCount > 0 ? ` · ${formatSize(overallSpeed)}/s` : ''}`}
+        format={(p) =>
+          `${p ?? 0}%${
+            overallSpeed > 0 && activeCount > 0
+              ? ` · ${formatSize(overallSpeed)}/s${overallEta ? ` · 剩余约 ${formatDuration(overallEta)}（${etaClock(overallEta)} 完成）` : ''}`
+              : ''
+          }`
+        }
       />
 
       {authExpired && (        <Alert
@@ -683,6 +730,7 @@ export default function UploadQueue() {
                       {speed > 0 && active && (
                         <Typography.Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
                           {formatSize(speed)}/s
+                          {etas[t.id] ? ` · 剩余 ${formatDuration(etas[t.id])}` : ''}
                         </Typography.Text>
                       )}
                     </div>
@@ -709,7 +757,7 @@ export default function UploadQueue() {
       <div className="upload-panel__footer">
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
           {running > 0
-            ? `${running} 个任务正在传输`
+            ? `${running} 个任务正在传输${overallEta ? ` · 剩余约 ${formatDuration(overallEta)}（预计 ${etaClock(overallEta)} 完成）` : ''}`
             : pausedCount > 0
               ? '已暂停，点击「全部继续」恢复'
               : allDone
@@ -740,6 +788,7 @@ export default function UploadQueue() {
           <span className="upload-panel-pill__text" onClick={expand} title="点击展开上传任务列表">
             {allDone ? `上传完成 ${summary} · 100%` : `上传 ${summary} · ${overallPct}%`}
             {overallSpeed > 0 && activeCount > 0 && <span className="upload-panel-pill__speed">{formatSize(overallSpeed)}/s</span>}
+            {overallEta && activeCount > 0 && <span className="upload-panel-pill__speed">约 {formatDuration(overallEta)}</span>}
             {totalFailed > 0 && <span className="upload-panel-pill__fail">{totalFailed} 失败</span>}
             {pausedCount > 0 && <span className="upload-panel-pill__fail">{pausedCount} 暂停</span>}
           </span>
